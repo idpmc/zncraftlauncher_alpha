@@ -93,9 +93,10 @@ export const downloadPool = new DownloadPool(MAX_CONCURRENT_DOWNLOADS)
 // ============ 全局连接预算（可在设置中调整） ============
 // 并行分块会放大连接数（worker 数 × 分块数），CDN 会因此限速甚至直接掐断，
 // 表现为"越下越慢"。这里给所有数据传输（单流文件 / 单个分块）设置统一上限。
-// 慢速线路下单连接常只有几十 KB/s，"连接数≈带宽"，上限过低会让大文件也快不起来，
-// 因此默认给到 48，并允许用户按自己的网络在 8~128 之间调整。
-let downloadThreads = 48
+// 慢速线路下单连接常只有几十 KB/s，"连接数≈带宽"，上限过低会让大文件也快不起来。
+// 默认 96：镜像与官方两条链路各分一半（见 index.ts 的候选链路轮转），
+// 单源并发因此和旧的 48 相当，但总吞吐翻倍；用户可在 8~128 之间调整。
+let downloadThreads = 96
 
 // ===== 分块数控制参数 =====
 // 实测（Modrinth 官方 CDN 与 MCIM 镜像都一样）这类源是**按单条连接限速**：
@@ -115,6 +116,7 @@ export function setDownloadThreads(n: number): number {
   const v = Math.round(Number(n))
   if (Number.isFinite(v) && v >= 8 && v <= 128) {
     downloadThreads = v
+    globalConnLimit.setLimit(v)
     console.log(`[Download] 并发线程数 = ${v}`)
   }
   return downloadThreads
@@ -124,31 +126,104 @@ export function getDownloadThreads(): number {
   return downloadThreads
 }
 
-let activeConnections = 0
-const connectionWaiters: (() => void)[] = []
+// ============ 连接预算（全局 + 单源）============
+// 这类 CDN（Modrinth 官方 / MCIM 镜像 / BMCLAPI）都是**按单条连接限速**的：
+// 单连接常常只有几十 KB/s，"连接数 ≈ 带宽"。所以提速的唯一有效手段是把并发连接摊开。
+//
+// 但单一来源有它的脾气：MCIM 镜像在约 64 条并发后会把 IP 拉黑（实测 128 条全挂）。
+// 之前所有连接共享同一个全局预算、且单流文件都从同一个地址起步，
+// 结果用户把线程调高时会把**全部**连接压到镜像上：既容易被限速/封禁，
+// 官方 CDN 又完全空闲。
+//
+// 现在拆成两层预算：
+//   - 全局预算 downloadThreads：所有数据传输的并发上限（设置里的"下载并发线程数"）
+//   - 单源预算：任一 host 的并发上限。国内镜像给得更保守（易封 IP），
+//     官方 / 通用源放宽，让"镜像 + 官方"两条链路各自跑满
+// 配合调用方在多条候选链路间轮转（见 index.ts 的 candidateUrls），
+// 就能把总并发放心拉高，而每个源都不越界。
+const MIRROR_CONN_LIMIT = 48   // 已知易封禁的国内镜像（MCIM / BMCLAPI 等）
+const DEFAULT_CONN_LIMIT = 96  // 其它来源（Modrinth 官方 CDN、GitHub、MediaFire 等）
+const CAPPED_MIRROR_HOSTS = ['mcimirror.top', 'bangbang93.com', 'mcbbs.net']
 
-function acquireConnection(): Promise<void> {
-  return new Promise((resolve) => {
-    if (activeConnections < downloadThreads) {
-      activeConnections++
-      resolve()
-      return
-    }
-    connectionWaiters.push(() => {
-      activeConnections++
-      resolve()
-    })
-  })
+function hostConnLimit(host: string): number {
+  const h = (host || '').toLowerCase()
+  return CAPPED_MIRROR_HOSTS.some(s => h === s || h.endsWith('.' + s))
+    ? MIRROR_CONN_LIMIT
+    : DEFAULT_CONN_LIMIT
 }
 
-function releaseConnection(): void {
-  activeConnections = Math.max(0, activeConnections - 1)
-  const next = connectionWaiters.shift()
-  if (next) next()
+class Semaphore {
+  private active = 0
+  private waiters: (() => void)[] = []
+  constructor(private limit: number) {}
+
+  setLimit(n: number): void {
+    this.limit = Math.max(1, Math.round(n))
+  }
+
+  async acquire(): Promise<void> {
+    // 每次 release 只唤醒一个等待者，被唤醒者重新判断条件，避免超发
+    while (this.active >= this.limit) {
+      await new Promise<void>(resolve => this.waiters.push(resolve))
+    }
+    this.active++
+  }
+
+  release(): void {
+    this.active = Math.max(0, this.active - 1)
+    const next = this.waiters.shift()
+    if (next) next()
+  }
+
+  get count(): number {
+    return this.active
+  }
+}
+
+const globalConnLimit = new Semaphore(downloadThreads)
+const perHostLimits = new Map<string, Semaphore>()
+
+function hostKey(url: string): string {
+  try {
+    return new URL(url).host
+  } catch {
+    return ''
+  }
+}
+
+function hostSemaphore(host: string): Semaphore {
+  let s = perHostLimits.get(host)
+  if (!s) {
+    s = new Semaphore(hostConnLimit(host))
+    perHostLimits.set(host, s)
+  }
+  return s
+}
+
+/**
+ * 占用一个连接额度：先占该 host 的单源额度、再占全局额度。
+ * 调用方必须在结束后用「同一个 url」调用 releaseConnection，两处必须配对，
+ * 否则额度会泄漏（最终所有下载都卡在等待额度上）。
+ */
+async function acquireConnection(url: string): Promise<void> {
+  const host = hostKey(url)
+  const hostSem = hostSemaphore(host)
+  await hostSem.acquire()
+  try {
+    await globalConnLimit.acquire()
+  } catch (e) {
+    hostSem.release()
+    throw e
+  }
+}
+
+function releaseConnection(url: string): void {
+  globalConnLimit.release()
+  hostSemaphore(hostKey(url)).release()
 }
 
 function getActiveConnections(): number {
-  return activeConnections
+  return globalConnLimit.count
 }
 
 // ============ Modrinth 国内镜像（MCIM） ============
@@ -380,13 +455,13 @@ async function tryParallelDownload(
           throw new Error('下载已取消')
         }
         let redirected = 0
-        // 该分块占用一个全局连接额度，避免 worker × 分块把连接数打爆
-        await acquireConnection()
+        // 该分块占用一个连接额度（全局 + 单源），避免 worker × 分块把连接数打爆
+        await acquireConnection(urlForChunk)
         let connectionHeld = true
         const releaseChunkConnection = () => {
           if (!connectionHeld) return
           connectionHeld = false
-          releaseConnection()
+          releaseConnection(urlForChunk)
         }
         try {
           const ok = await new Promise<boolean>((resolveC, rejectC) => {
@@ -550,21 +625,21 @@ async function downloadFileSingle(
   onRequestCreated?: (req: http.ClientRequest) => void,
   followRedirects: boolean = true
 ): Promise<void> {
-  // 该文件的单流下载占用一个全局连接额度（拿到后无论成败都会归还）
-  await acquireConnection()
-  // 包裹 resolve/reject，保证无论成功、失败还是取消都会归还全局连接额度
+  // 该文件的单流下载占用一个连接额度（全局 + 单源），拿到后无论成败都会归还
+  await acquireConnection(url)
+  // 包裹 resolve/reject，保证无论成功、失败还是取消都会归还连接额度
   return new Promise<void>((resolveOuter, rejectOuter) => {
     let settled = false
     const resolve = () => {
       if (settled) return
       settled = true
-      releaseConnection()
+      releaseConnection(url)
       resolveOuter()
     }
     const reject = (err: any) => {
       if (settled) return
       settled = true
-      releaseConnection()
+      releaseConnection(url)
       rejectOuter(err)
     }
     let cancelled = false

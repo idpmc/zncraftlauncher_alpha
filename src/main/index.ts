@@ -4868,10 +4868,10 @@ async function downloadModpackFiles(versionsDir: string, onProgress?: (done: num
   }
 
   // 清理上次中断残留的临时分片，避免占用磁盘与误判
-  // 并行下载最多产生 8 个分片（part0-part7），全部清理
+  // 分片数由 download-utils 决定，最多可达 128 块（CHUNK_MAX），这里一并清理
   const cleanStaleTmp = (destPath: string) => {
     try {
-      for (let i = 0; i < 8; i++) {
+      for (let i = 0; i < 128; i++) {
         const p = `${destPath}.tmp.part${i}`
         if (fs.existsSync(p)) fs.unlinkSync(p)
       }
@@ -4932,8 +4932,14 @@ async function downloadModpackFiles(versionsDir: string, onProgress?: (done: num
       return
     }
 
+    // 单源并发均衡：不同文件从不同的候选链路开始下载。
+    // 这类 CDN 按"单条连接"限速，若所有并发文件都从同一个地址（镜像）起步，
+    // 几十条连接会全压在镜像上被限速、而官方 CDN 空闲；轮转后两条链路各分一半。
+    const rotateBy = urls.length > 1 ? idx % urls.length : 0
+    const candidateUrls = rotateBy > 0 ? urls.slice(rotateBy).concat(urls.slice(0, rotateBy)) : urls
+
     let ok = false
-    for (const url of urls) {
+    for (const url of candidateUrls) {
       try {
         // Modrinth CDN 直链无需重定向解析，跳过省一次 HTTP 请求。
         // 但注意 cdn.modrinth.com 实际返回 307 跳转到真实存储，
@@ -4950,6 +4956,13 @@ async function downloadModpackFiles(versionsDir: string, onProgress?: (done: num
 
         const tmpPath = destPath + '.tmp'
         currentName = baseName
+        // 注意 downloadFile 的参数顺序：
+        //   (url, dest, onProgress, onCancel, maxRetries, onPauseCheck,
+        //    onRequestCreated, followRedirects, knownTotalSize, expectedSha1, altUrls)
+        // 这里第 10 个参数（expectedSha1）传 undefined —— 完整性由本函数下方的
+        // 大小 + sha1 双重校验负责；第 11 个参数传候选链路列表，让分块下载
+        // 能把并发摊到"镜像 + 官方"两条链路上（之前错把 urls 传到 expectedSha1，
+        // 导致 SHA-1 校验抛异常、每个文件都被误判失败，且多链路完全不生效）。
         await downloadFile(finalUrl, tmpPath, (fileProgress, fileSpeed, fileThreads) => {
           const currentBytes = fileSize > 0
             ? Math.min(fileSize, Math.round((Math.max(0, Math.min(100, fileProgress)) / 100) * fileSize))
@@ -4958,7 +4971,7 @@ async function downloadModpackFiles(versionsDir: string, onProgress?: (done: num
           inflightBytes.set(idx, currentBytes)
           inflightThreads.set(idx, fileThreads || 1)
           report()
-        }, undefined, useChunked ? 5 : 3, undefined, undefined, true, fileSize, urls)
+        }, undefined, useChunked ? 5 : 3, undefined, undefined, true, fileSize, undefined, candidateUrls)
 
         // 强制校验大小：连接被提前关闭时下载会"成功返回"但文件是截断的，
         // 没有这一步，残缺文件会被当成完整文件写进整合包（表现为进游戏崩 mods）
@@ -5021,11 +5034,12 @@ async function downloadModpackFiles(versionsDir: string, onProgress?: (done: num
   // 大文件排最后，避免它们占满连接额度拖慢前面的小文件
   files.sort((a: any, b: any) => (a.fileSize || 0) - (b.fileSize || 0))
 
-  // 并发 worker 数：连接数由 download-utils 的全局预算(downloadThreads)统一控制，
+  // 并发 worker 数：连接数由 download-utils 的全局 + 单源预算统一控制，
   // 这里可以多开一些，让小文件（握手开销占主导）尽快铺满带宽。
   // 实测这类源按"单条连接"限速(~20KB/s)，所以并发文件数越多总吞吐越高：
-  // 跟随用户线程数设置（下限 8、上限 64），用户在设置里拉高线程时这块也一起生效。
-  const MAX_CONCURRENT_FILES = Math.max(8, Math.min(64, getDownloadThreads()))
+  // 跟随用户线程数设置（下限 8、上限 128）。上限必须能跟上线程设置，
+  // 否则用户把线程从 64 往上调时这一层会成为瓶颈、调了也没效果。
+  const MAX_CONCURRENT_FILES = Math.max(8, Math.min(128, getDownloadThreads()))
   let cursor = 0
   const worker = async () => {
     while (cursor < files.length) {

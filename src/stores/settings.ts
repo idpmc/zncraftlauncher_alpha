@@ -271,7 +271,7 @@ export const useSettingsStore = defineStore('settings', () => {
     gameDownloadPath: '',
     maxDownloadSpeed: 0,
     downloadSource: 'mirror',
-    downloadThreads: 48,
+    downloadThreads: 96,
     modrinthMirror: true,
     proxyEnabled: false,
     proxyType: 'http',
