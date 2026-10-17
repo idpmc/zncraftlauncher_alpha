@@ -1,0 +1,72 @@
+// ============ 基础色板（深色为默认）============
+$bg-primary: #0d0d0d;
+$bg-secondary: #141414;
+$bg-tertiary: #1a1a1a;
+$bg-card: #1e1e1e;
+$bg-elevated: #242424;
+$bg-hover: #252525;
+$bg-active: #2e2e2e;
+
+$text-primary: #ffffff;
+$text-secondary: #a0a0a0;
+$text-tertiary: #8f8f8f;
+$text-muted: #6b6b6b;
+$text-inverse: #0d0d0d;
+
+$accent-primary: #5c7cfa;
+$accent-secondary: #4c6ef5;
+$accent-hover: #6b89ff;
+$accent-soft: rgba(92, 124, 250, 0.14);
+$accent-glow: rgba(92, 124, 250, 0.3);
+
+$success: #40c057;
+$warning: #fab005;
+$error: #fa5252;
+$info: #22b8cf;
+$success-soft: rgba(64, 192, 87, 0.14);
+$warning-soft: rgba(250, 176, 5, 0.14);
+$error-soft: rgba(250, 82, 82, 0.14);
+$info-soft: rgba(34, 184, 207, 0.14);
+
+$border-color: #2a2a2a;
+$border-strong: #3a3a3a;
+$border-subtle: #1e1e1e;
+
+// ============ 圆角 ============
+$radius-xs: 6px;
+$border-radius-sm: 8px;
+$border-radius: 12px;
+$radius-lg: 16px;
+$radius-full: 999px;
+
+// ============ 间距刻度 ============
+$sp-1: 4px;
+$sp-2: 8px;
+$sp-3: 12px;
+$sp-4: 16px;
+$sp-5: 20px;
+$sp-6: 24px;
+$sp-8: 32px;
+
+// ============ 字号刻度 ============
+$fs-xs: 11px;
+$fs-sm: 12px;
+$fs-base: 13px;
+$fs-md: 14px;
+$fs-lg: 16px;
+$fs-xl: 20px;
+$fs-2xl: 24px;
+
+// ============ 过渡 / 缓动 ============
+$transition-fast: 0.15s ease;
+$transition-normal: 0.25s ease;
+$transition-slow: 0.35s ease;
+$ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+$ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+
+// ============ 阴影 ============
+$shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
+$shadow-md: 0 4px 16px rgba(0, 0, 0, 0.4);
+$shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.5);
+$shadow-xl: 0 16px 48px rgba(0, 0, 0, 0.55);
+$shadow-glow: 0 0 20px rgba(92, 124, 250, 0.2);

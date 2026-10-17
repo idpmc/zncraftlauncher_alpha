@@ -1,0 +1,129 @@
+{
+  "name": "zncraftlauncher",
+  "version": "0.3.63-alpha",
+  "description": "ZNCraftLauncher Alpha - A high-quality Minecraft launcher similar to PCL",
+  "main": "out/main/index.js",
+  "author": "ZNCraft",
+  "scripts": {
+    "dev": "vite",
+    "bump": "node scripts/bump-version.js",
+    "build": "vite build",
+    "preview": "vite preview",
+    "package": "electron-builder",
+    "package:signed": "node scripts/require-cert.js && electron-builder --win nsis --config.win.signAndEditExecutable=true",
+    "verify:signature": "node scripts/verify-signature.js"
+  },
+  "dependencies": {
+    "@vueuse/core": "^10.9.0",
+    "adm-zip": "^0.6.0",
+    "axios": "^1.6.8",
+    "electron-updater": "^6.1.8",
+    "peerjs": "^1.5.5",
+    "pinia": "^2.1.7",
+    "vue": "^3.4.21",
+    "vue-i18n": "^9.14.5"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.0",
+    "electron": "^30.0.0",
+    "electron-builder": "^24.13.3",
+    "sass": "^1.72.0",
+    "typescript": "^5.4.2",
+    "vite": "^5.1.6",
+    "vite-plugin-electron": "^0.29.1",
+    "vue-tsc": "^1.8.27"
+  },
+  "build": {
+    "appId": "com.zncl.launcher",
+    "productName": "ZNCraftLauncher",
+    "artifactName": "${productName}-${version}-Setup.${ext}",
+    "directories": {
+      "output": "../release"
+    },
+    "files": [
+      "out/**/*",
+      "dist/**/*"
+    ],
+    "electronDownload": {
+      "mirror": "https://cdn.npmmirror.com/binaries/electron/"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false,
+      "signingHashAlgorithms": [
+        "sha256"
+      ],
+      "rfc3161TimeStampServer": "http://timestamp.digicert.com",
+      "verifyUpdateCodeSignature": false
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.games",
+      "artifactName": "${productName}-${version}-mac-${arch}.${ext}",
+      "identity": null
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "category": "Game",
+      "artifactName": "${productName}-${version}-linux-${arch}.${ext}",
+      "executableName": "zncraftlauncher"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "ZNCraftLauncher",
+      "unicode": true,
+      "runAfterFinish": false,
+      "warningsAsErrors": false,
+      "include": "build/installer.nsh",
+      "deleteAppDataOnUninstall": false,
+      "installerIcon": null,
+      "uninstallerIcon": null
+    },
+    "publish": {
+      "provider": "generic",
+      "url": "https://your-update-server.com/releases/"
+    }
+  }
+}
