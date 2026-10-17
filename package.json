@@ -5,10 +5,10 @@
   "main": "out/main/index.js",
   "author": "ZNCraft",
   "scripts": {
-    "dev": "vite",
+    "dev": "node scripts/utf8-run.js vite",
     "bump": "node scripts/bump-version.js",
-    "build": "vite build",
-    "preview": "vite preview",
+    "build": "node scripts/utf8-run.js vite build",
+    "preview": "node scripts/utf8-run.js vite preview",
     "package": "electron-builder",
     "package:signed": "node scripts/require-cert.js && electron-builder --win nsis --config.win.signAndEditExecutable=true",
     "verify:signature": "node scripts/verify-signature.js"
