@@ -1091,6 +1091,38 @@ async function scanJavaCandidates(force = false): Promise<JavaCandidate[]> {
 // 导致「只有 23+ 可用」时 23 会被优先选中而 25 被跳过。
 const OFFICIAL_JAVA = 21
 
+// 依据 Minecraft 版本号推断所需的 Java 版本与类型。
+//
+// 旧实现直接用 /^(?:1\.)?(\d+)\.(\d+)/ 取「major/minor」，随后却按 major 判断，
+// 导致不同位数版本号的语义完全不一致：
+//   "1.21"   -> major=1,  minor=21  -> 落不进 major>=21 分支 -> 默认 Java 17（错误！）
+//   "1.21.4" -> major=21, minor=4   -> 命中 Java 21（正确）
+// 于是「1.21」这种两段式整合包（如 Fabric 1.21）会被错误地用 Java 17 启动，
+// Fabric API 等 mod 便会报「需要 Java 21」。
+//
+// 这里统一做法：先剥掉发行号前缀 "1."，再取「次版本.补丁」，语义对
+// "1.21" / "1.21.4" / "1.20.6" / "26.1" 全部一致。
+function requiredJavaForMcVersion(mcVersion: string): { version: number; type: 'legacy' | 'modern' | 'latest' } | null {
+  const normalized = String(mcVersion || '').trim().replace(/^1\./, '')
+  const m = normalized.match(/^(\d+)(?:\.(\d+))?/)
+  if (!m) return null
+  const minor = parseInt(m[1], 10)
+  const patch = m[2] ? parseInt(m[2], 10) : 0
+  if (Number.isNaN(minor)) return null
+
+  // Java 25：Minecraft 1.25+ / 26+
+  if (minor >= 25) return { version: 25, type: 'latest' }
+  // Java 21：Minecraft 1.21+，以及 1.20.5–1.20.6
+  if (minor >= 21) return { version: 21, type: 'latest' }
+  if (minor === 20 && patch >= 5) return { version: 21, type: 'latest' }
+  // Java 17：Minecraft 1.18–1.20.4
+  if (minor >= 18) return { version: 17, type: 'modern' }
+  // Java 16：Minecraft 1.17
+  if (minor === 17) return { version: 16, type: 'modern' }
+  // Java 8：Minecraft 1.16.5 及以下
+  return { version: 8, type: 'modern' }
+}
+
 // 取满足 lowerBound 的最高版本
 function newestAtLeast(candidates: JavaCandidate[], lowerBound: number): JavaCandidate | undefined {
   return candidates
@@ -2275,59 +2307,16 @@ ipcMain.handle('launch-game', async (event, versionId: string, username?: string
         javaBaseVersion = resolvedMc
       }
     }
-    const mcVersionMatch = javaBaseVersion.match(/^(?:1\.)?(\d+)\.(\d+)(?:\.(\d+))?/)
+    const javaNeed = requiredJavaForMcVersion(javaBaseVersion)
     let requiredJavaVersion = 17
     let javaType: 'legacy' | 'modern' | 'latest' = 'modern'
 
     if (isLegacy) {
       javaType = 'legacy'
       requiredJavaVersion = 8
-    } else if (mcVersionMatch) {
-      // 支持 "1.26.1" 或 "26.1" 格式
-      const major = parseInt(mcVersionMatch[1])
-      const minor = parseInt(mcVersionMatch[2])
-      const patch = parseInt(mcVersionMatch[3] || '0')
-
-      // Minecraft 1.26.1+ 或 26.1+ 需要 Java 25
-      if (major > 25 || (major === 26 && patch >= 1)) {
-        javaType = 'latest'
-        requiredJavaVersion = 25
-      }
-      // Minecraft 1.25+ 或 25+ 需要 Java 25
-      else if (major >= 25) {
-        javaType = 'latest'
-        requiredJavaVersion = 25
-      }
-      // Minecraft 1.21.2+ 或 21.2+ 需要 Java 21
-      else if (major === 21 && patch >= 2) {
-        javaType = 'latest'
-        requiredJavaVersion = 21
-      }
-      // Minecraft 1.21+ 或 21+ 需要 Java 21
-      else if (major >= 21) {
-        javaType = 'latest'
-        requiredJavaVersion = 21
-      }
-      // Minecraft 1.20.5+ 需要 Java 21
-      else if (major === 20 && patch >= 5) {
-        javaType = 'latest'
-        requiredJavaVersion = 21
-      }
-      // Minecraft 1.18-1.20 需要 Java 17
-      else if (major >= 18) {
-        javaType = 'modern'
-        requiredJavaVersion = 17
-      }
-      // Minecraft 1.17 需要 Java 16
-      else if (major === 17) {
-        javaType = 'modern'
-        requiredJavaVersion = 16
-      }
-      // Minecraft 1.13-1.16 需要 Java 8-15
-      else if (major >= 13) {
-        javaType = 'modern'
-        requiredJavaVersion = 8
-      }
+    } else if (javaNeed) {
+      javaType = javaNeed.type
+      requiredJavaVersion = javaNeed.version
     }
 
     console.log(`[Main] 是否为远古版: ${isLegacy}, 需要的 Java 版本: ${requiredJavaVersion}`)
@@ -3299,40 +3288,13 @@ ipcMain.handle('start-server', async (event, versionId: string, maxMemory: strin
       return { success: false, error: mt('mc.serverJarMissing') }
     }
 
-    const mcVersionMatch = versionId.match(/^(?:1\.)?(\d+)\.(\d+)(?:\.(\d+))?/)
+    const javaNeed = requiredJavaForMcVersion(versionId)
     let requiredJavaVersion = 17
     let javaType: 'legacy' | 'modern' | 'latest' = 'modern'
 
-    if (mcVersionMatch) {
-      const major = parseInt(mcVersionMatch[1])
-      const minor = parseInt(mcVersionMatch[2])
-      const patch = parseInt(mcVersionMatch[3] || '0')
-
-      if (major > 25 || (major === 26 && patch >= 1)) {
-        javaType = 'latest'
-        requiredJavaVersion = 25
-      } else if (major >= 25) {
-        javaType = 'latest'
-        requiredJavaVersion = 25
-      } else if (major === 21 && patch >= 2) {
-        javaType = 'latest'
-        requiredJavaVersion = 21
-      } else if (major >= 21) {
-        javaType = 'latest'
-        requiredJavaVersion = 21
-      } else if (major === 20 && patch >= 5) {
-        javaType = 'latest'
-        requiredJavaVersion = 21
-      } else if (major >= 18) {
-        javaType = 'modern'
-        requiredJavaVersion = 17
-      } else if (major === 17) {
-        javaType = 'modern'
-        requiredJavaVersion = 16
-      } else {
-        javaType = 'modern'
-        requiredJavaVersion = 8
-      }
+    if (javaNeed) {
+      javaType = javaNeed.type
+      requiredJavaVersion = javaNeed.version
     }
 
     const allowNewerJava = options?.skipJavaCheck === true
