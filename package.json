@@ -6,6 +6,7 @@
   "author": "ZNCraft",
   "scripts": {
     "dev": "node scripts/utf8-run.js vite",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test \"src/**/*.test.ts\"",
     "bump": "node scripts/bump-version.js",
     "build": "node scripts/utf8-run.js vite build",
     "preview": "node scripts/utf8-run.js vite preview",

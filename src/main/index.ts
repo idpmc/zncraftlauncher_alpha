@@ -13,6 +13,7 @@ import { downloadFile, downloadPool, formatSpeed, setForceCancelAllDownloads, ge
 import { initFileLogger, getLogFilePath, getLogDir, readLogsForCopy } from './file-logger'
 import { mt, setMainLocale } from './locale'
 import { setProxyConfig, getProxyConfig, httpFetch, testProxyConnection, proxyRulesString, proxyBypassString, gameProxyJvmArgs, loadProxyConfigFromFile, saveProxyConfigToFile } from './proxy'
+import { classifyGameStderr, detectGameErrorHint, nativeExitCodeHintKey, createGameLogDecoder, splitLogLines } from '../shared/game-log'
 
 // 尽早接管控制台输出：打包后没有终端，日志必须落盘才能排查失败原因
 initFileLogger()
@@ -2212,19 +2213,10 @@ function normalizeMemArgValue(raw: string): number | null {
 // Windows 原生退出码 → 人类可读说明。
 // 游戏以 0xC0000005 这类 NTSTATUS 退出时，多数不是 Java 异常（没有 hs_err），
 // 而是 JVM/显卡驱动/LWJGL 在原生代码里出错，给用户一个可操作的提示。
+// 解析（退出码 → locale key）在 src/shared/game-log.ts，这里只负责翻译。
 function describeNativeExitCode(code: number | null): string | null {
-  if (code === null || code === undefined) return null
-  // Node 在 Windows 上可能给出无符号(3221225477)或有符号(-1073741819)形式，统一成无符号比较
-  const unsigned = code >>> 0
-  const table: Record<number, string> = {
-    3221225477: 'mc.nativeAccessViolation',
-    3221225725: 'mc.nativeStackOverflow',
-    3221226505: 'mc.nativeStackBufferOverrun',
-    3221225781: 'mc.nativeMissingDll',
-    3221225794: 'mc.nativeDllInitFailed',
-    3221226356: 'mc.nativeHeapCorruption'
-  }
-  return table[unsigned] ? mt(table[unsigned]) : null
+  const hintKey = nativeExitCodeHintKey(code)
+  return hintKey ? mt(hintKey) : null
 }
 
 // 规范化所有 -Xmx / -Xms 参数：去掉小数、限制在安全范围内、保证 Xms <= Xmx。
@@ -2647,6 +2639,10 @@ ipcMain.handle('launch-game', async (event, versionId: string, username?: string
         '-Xmx1G',
         '-Xms512M',
         '-Dfile.encoding=UTF-8',
+        // JDK 18+（JEP 400）后 stdout/stderr 默认用控制台原生编码（中文 Windows 是 GBK），
+        // 启动器按 UTF-8 解码游戏日志会变乱码，这里强制 UTF-8（低版本 JDK 忽略该属性，无副作用）
+        '-Dstdout.encoding=UTF-8',
+        '-Dstderr.encoding=UTF-8',
         '-Dsun.java2d.noddraw=true',
         '-Dsun.java2d.d3d=false',
         '-Dsun.java2d.opengl=false',
@@ -2678,6 +2674,11 @@ ipcMain.handle('launch-game', async (event, versionId: string, username?: string
         '-XX:ReservedCodeCacheSize=256M',
         // UTF-8 编码，防止中文乱码
         '-Dfile.encoding=UTF-8',
+        // JDK 18+（JEP 400）后 stdout/stderr 默认按控制台原生编码（中文 Windows = GBK）输出，
+        // 而启动器按 UTF-8 解码，游戏日志里的中文会变乱码；强制输出 UTF-8。
+        // （低版本 JDK 只是多一个用不到的系统属性，无副作用）
+        '-Dstdout.encoding=UTF-8',
+        '-Dstderr.encoding=UTF-8',
         // Java 9+ 模块系统开放参数（必须，否则会报 InaccessibleObjectException）
         '--add-opens=java.base/java.io=ALL-UNNAMED',
         '--add-opens=java.base/java.lang=ALL-UNNAMED',
@@ -2884,9 +2885,10 @@ ipcMain.handle('launch-game', async (event, versionId: string, username?: string
       const xmsArg = jvmArgs.find(a => /^-Xms/i.test(a))
       const gcName = jvmArgs.includes('-XX:+UseG1GC') ? 'G1GC' : 'JVM 默认'
       const encArg = jvmArgs.find(a => a.startsWith('-Dfile.encoding='))
+      const stdoutEncArg = jvmArgs.find(a => a.startsWith('-Dstdout.encoding='))
       launchLog(`系统内存：总 ${(totalmem() / 1024 ** 3).toFixed(1)}G / 可用 ${(freemem() / 1024 ** 3).toFixed(1)}G`)
       launchLog(`内存分配：${xmxArg || '默认'}${xmsArg ? ' ' + xmsArg : ''}（已按系统内存自动校正）`)
-      launchLog(`垃圾回收：${gcName}   文件编码：${encArg ? encArg.split('=')[1] : 'UTF-8'}`)
+      launchLog(`垃圾回收：${gcName}   文件编码：${encArg ? encArg.split('=')[1] : 'UTF-8'}   日志输出编码：${stdoutEncArg ? stdoutEncArg.split('=')[1] : '随文件编码'}`)
       if (loaderJvmCount > 0 || loaderGameCount > 0) {
         launchLog(`加载器参数：来自版本 JSON（JVM ${loaderJvmCount} 条 / 游戏 ${loaderGameCount} 条）`)
       }
@@ -2951,8 +2953,14 @@ ipcMain.handle('launch-game', async (event, versionId: string, username?: string
 
     launchLog(`游戏进程已启动（PID ${gameProcess.pid ?? '未知'}）`)
 
+    // stdout / stderr 各用一个流式解码器（不能共用）：
+    //   - 配合 -Dstdout.encoding=UTF-8，修 JDK 18+ 按控制台编码（GBK）输出导致的中文乱码
+    //   - 中文字符被 data 事件切成两半时，未解完的字节留到下一块，切口不再出替换字符
+    const decodeStdout = createGameLogDecoder()
+    const decodeStderr = createGameLogDecoder()
+
     gameProcess.stdout?.on('data', (data: Buffer) => {
-      const output = data.toString()
+      const output = decodeStdout(data)
       stdout += output
       hasOutput = true
       console.log('[Game]', output.trim())
@@ -2960,27 +2968,13 @@ ipcMain.handle('launch-game', async (event, versionId: string, username?: string
     })
 
     gameProcess.stderr?.on('data', (data: Buffer) => {
-      const output = data.toString()
+      const output = decodeStderr(data)
       stderr += output
       hasOutput = true
       console.error('[Game Error]', output.trim())
 
-      // 更精确的错误检测
-      const isRealError =
-        output.includes('Exception') ||
-        output.includes('ERROR:') ||
-        output.includes('Error:') ||
-        output.includes('FATAL') ||
-        output.includes('Failed to') ||
-        (output.includes('ERROR') && output.includes('java.'))
-
-      if (isRealError) {
-        sendGameLog('error', output.trim())
-      } else if (output.includes('WARN') || output.includes('WARNING')) {
-        sendGameLog('warn', output.trim())
-      } else {
-        sendGameLog('info', output.trim())
-      }
+      // 分级逻辑（异常/FATAL/WARN -> error/warn/info）在 src/shared/game-log.ts
+      sendGameLog(classifyGameStderr(output), output.trim())
     })
 
     gameProcess.on('error', (err: Error) => {
@@ -3020,22 +3014,11 @@ ipcMain.handle('launch-game', async (event, versionId: string, username?: string
       if (stdout) sendGameLog('info', mt('mc.stdoutLabel', { text: stdout.substring(0, 2000) }))
       if (stderr) sendGameLog('error', mt('mc.stderrLabel', { text: stderr.substring(0, 2000) }))
 
-      // 分析常见错误
+      // 分析常见错误（判定规则在 src/shared/game-log.ts，这里只翻译成用户文案）
       let errorHint = ''
-      if (stderr.includes('UnsupportedClassVersionError')) {
-        errorHint = mt('mc.hintJavaVersion')
-      } else if (stderr.includes('NoClassDefFoundError') || stderr.includes('ClassNotFoundException')) {
-        errorHint = mt('mc.hintMissingLibs')
-      } else if (stderr.includes('OutOfMemoryError')) {
-        errorHint = mt('mc.hintOutOfMemory')
-      } else if (stderr.includes('LWJGL')) {
-        errorHint = mt('mc.hintLwjgl')
-      } else if (stderr.includes('Could not find or load main class')) {
-        errorHint = mt('mc.hintMainClass')
-      } else if (stderr.includes('AccessControlException') || stderr.includes('SecurityException')) {
-        errorHint = mt('mc.hintSecurity')
-      } else if (stderr.includes('IllegalStateException') || stderr.includes('RuntimeException')) {
-        errorHint = mt('mc.hintRuntime')
+      const hintKey = detectGameErrorHint(stderr)
+      if (hintKey) {
+        errorHint = mt(hintKey)
       }
 
       // 原生崩溃码（0xC0000005 等）通常不产生 Java 异常堆栈，单独识别
@@ -3367,6 +3350,9 @@ ipcMain.handle('start-server', async (event, versionId: string, maxMemory: strin
       '-Dusing.aikars.flags=https://mcflags.emc.gs',
       '-Daikars.new.flags=true',
       '-Dfile.encoding=UTF-8',
+      // 同游戏进程：JDK 18+ 下 stdout/stderr 默认按控制台编码（GBK）输出，强制 UTF-8
+      '-Dstdout.encoding=UTF-8',
+      '-Dstderr.encoding=UTF-8',
       '-jar',
       serverJar,
       'nogui'
@@ -3376,6 +3362,10 @@ ipcMain.handle('start-server', async (event, versionId: string, maxMemory: strin
     sendServerLog('info', mt('mc.serverStarting', { version: versionId }))
     sendServerLog('info', mt('mc.serverMaxMemory', { max: serverMaxMB, min: serverMinMB }))
 
+    // 流式解码，理由同游戏进程（JDK 18+ 编码 / 多字节字符跨块）
+    const decodeServerStdout = createGameLogDecoder()
+    const decodeServerStderr = createGameLogDecoder()
+
     serverProcess = spawn(javaPath, serverArgs, {
       cwd: serverDir,
       detached: false,
@@ -3383,25 +3373,13 @@ ipcMain.handle('start-server', async (event, versionId: string, maxMemory: strin
     })
 
     serverProcess.stdout?.on('data', (data: Buffer) => {
-      const output = data.toString().trim()
-      if (output) {
-        output.split('\n').forEach(line => {
-          if (line.trim()) {
-            sendServerLog('info', line.trim())
-          }
-        })
-      }
+      const output = decodeServerStdout(data)
+      splitLogLines(output).forEach(line => sendServerLog('info', line))
     })
 
     serverProcess.stderr?.on('data', (data: Buffer) => {
-      const output = data.toString().trim()
-      if (output) {
-        output.split('\n').forEach(line => {
-          if (line.trim()) {
-            sendServerLog('error', line.trim())
-          }
-        })
-      }
+      const output = decodeServerStderr(data)
+      splitLogLines(output).forEach(line => sendServerLog('error', line))
     })
 
     serverProcess.on('exit', (code: number) => {

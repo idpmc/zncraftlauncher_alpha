@@ -2,6 +2,9 @@ export default {
   zh: {
     home: {
 
+      news32Title: '修复高版本 Java 下游戏日志中文乱码',
+      news32Desc: 'JDK 18 起（JEP 400）stdout/stderr 默认改用控制台的原生编码（中文 Windows 是 GBK），启动器按 UTF-8 读就成了乱码。现在启动游戏与本地服务器都会强制 -Dstdout.encoding / -Dstderr.encoding=UTF-8，日志里的中文恢复正常；日志解码同时改为流式处理，一个中文字符被数据块切在中间也不会再出现替换字符。另外，游戏日志的分级与错误提示解析抽到了 src/shared/game-log.ts，并补了 17 条单元测试（npm test）。',
+
       news31Title: '启动日志：中文分步输出',
       news31Desc: '启动游戏时，日志面板与日志文件现在会逐步打印中文启动流程：预检测是否通过、当前账号、需要的 Java 版本、选中的 Java 及路径、系统内存与分配的内存、垃圾回收器、文件编码、加载器（版本 JSON）注入的参数条数、类路径库数量、工作目录、最终启动命令，以及游戏进程的启动 PID 与退出结果。出问题时一眼就能看出卡在哪一步。',
 
@@ -181,6 +184,9 @@ export default {
   },
   en: {
     home: {
+
+      news32Title: 'Garbled Chinese game logs on Java 18+ fixed',
+      news32Desc: 'Since JDK 18 (JEP 400) stdout/stderr default to the console\'s native encoding (GBK on Chinese Windows), so reading them as UTF-8 produced mojibake. The game and the local server are now launched with -Dstdout.encoding / -Dstderr.encoding=UTF-8, and log decoding is streaming, so a Chinese character split across two data chunks no longer turns into replacement characters. The log level classification and error-hint parsing also moved into src/shared/game-log.ts, covered by 17 unit tests (npm test).',
 
       news31Title: 'Launch log: step-by-step Chinese output',
       news31Desc: 'When launching the game, the log panel and log file now print the launch pipeline step by step in Chinese: pre-checks, current account, required Java version, the selected Java and its path, system memory and allocated heap, garbage collector, file encoding, how many args the loader (version JSON) injected, classpath library count, working directory, the final launch command, plus the game process PID and exit result. When something goes wrong you can see exactly which step failed.',

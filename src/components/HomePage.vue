@@ -114,6 +114,8 @@ const quickActions = computed(() => [
 
 const newsItems = computed(() => [
 
+  { date: '10-18', title: t('home.news32Title'), desc: t('home.news32Desc') },
+
   { date: '10-17', title: t('home.news31Title'), desc: t('home.news31Desc') },
 
   { date: '10-17', title: t('home.news30Title'), desc: t('home.news30Desc') },
