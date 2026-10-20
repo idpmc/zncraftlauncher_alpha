@@ -9,8 +9,10 @@
     "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test \"src/**/*.test.ts\"",
     "bump": "node scripts/bump-version.js",
     "build": "node scripts/utf8-run.js vite build",
+    "build:intl": "node scripts/build-intl.js",
     "preview": "node scripts/utf8-run.js vite preview",
     "package": "electron-builder",
+    "package:intl": "node scripts/build-intl.js --package",
     "package:signed": "node scripts/require-cert.js && electron-builder --win nsis --config.win.signAndEditExecutable=true",
     "verify:signature": "node scripts/verify-signature.js"
   },
