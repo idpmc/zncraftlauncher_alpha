@@ -10,9 +10,10 @@ const APP_VERSION: string = pkg.version
 const APP_VERSION_CORE = APP_VERSION.split('-')[0]
 const APP_LABEL = APP_VERSION.includes('-') ? `Alpha ${APP_VERSION_CORE}` : APP_VERSION_CORE
 
-// 是否启用「原版游戏本体下载」能力。
-// 国内发行版（npm run build）为 false：构建期物理剔除 src/main/download/ 整个目录，
-// 产物中不含 bmclapi / launchermeta.mojang.com 等字符串，反编译也找不到下载逻辑。
+// 是否启用「原版游戏本体下载」能力（A 阶段：运行时开关）。
+// 国内发行版（npm run build）为 false：界面无下载入口，相关分支在打包时被死代码消除。
+// 注意（如实描述）：这是运行时/构建期开关，源码与产物中仍包含下载相关代码，
+// 不得对外宣称"反编译找不到下载逻辑"。真正的物理剔除见 docs/合规整改清单.md 的 B 阶段。
 // 开源开发版（npm run build:intl）显式置 true 才开启。
 const ENABLE_MC_DOWNLOAD = process.env.ZNCL_MC_DOWNLOAD === '1'
 
