@@ -30,7 +30,14 @@ export const useVersionsStore = defineStore('versions', () => {
 
   const notifications = ref<{ id: string; versionId: string; versionName: string; type: 'downloading' | 'completed' | 'failed' | 'info'; progress: number; message?: string; timestamp: number }[]>([])
 
+  // 用户手动关闭过的通知（按 versionId 记录），关闭后该下载的进度更新不再重新弹出
+  const dismissedNotifications = new Set<string>()
+
   const addNotification = (versionId: string, versionName: string, type: 'downloading' | 'completed' | 'failed' | 'info', progress: number = 0, message?: string) => {
+    // 用户已手动关闭该版本的下载横幅，忽略后续高频的进度更新，避免"关掉又弹出"
+    // （completed / failed 属于一次性结果，仍需正常提示给用户）
+    if (type === 'downloading' && dismissedNotifications.has(versionId)) return
+
     const id = `notif-${versionId}-${Date.now()}`
     
     const existing = notifications.value.find(n => n.versionId === versionId)
@@ -60,7 +67,12 @@ export const useVersionsStore = defineStore('versions', () => {
 
   const removeNotification = (id: string) => {
     const idx = notifications.value.findIndex(n => n.id === id)
-    if (idx > -1) notifications.value.splice(idx, 1)
+    if (idx > -1) {
+      const removed = notifications.value[idx]
+      // 只记下"下载中"的横幅：关掉后不再被进度事件复活
+      if (removed.type === 'downloading') dismissedNotifications.add(removed.versionId)
+      notifications.value.splice(idx, 1)
+    }
   }
 
   // ========== 资源完整性检查状态（全局，切换界面不丢失） ==========
@@ -726,6 +738,9 @@ export const useVersionsStore = defineStore('versions', () => {
     isDownloading.value = true
 
     const versionDisplayName = version.displayName || directoryName
+
+    // 重新发起下载时恢复该版本的通知
+    dismissedNotifications.delete(directoryName)
 
     // 添加到统一的下载任务
     downloadsStore.addTask({
