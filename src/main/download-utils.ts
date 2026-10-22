@@ -44,7 +44,7 @@ export function getForceCancelAllDownloads(): boolean {
 export interface DownloadOptions {
   url: string
   dest: string
-  onProgress?: (progress: number, speed?: number, threads?: number) => void
+  onProgress?: (progress: number, speed?: number, threads?: number, totalBytes?: number) => void
   onCancel?: () => boolean
   onPauseCheck?: () => boolean
   onRequestCreated?: (req: http.ClientRequest) => void
@@ -340,7 +340,7 @@ async function probeRangeUrl(url: string): Promise<{ finalUrl: string; total: nu
 async function tryParallelDownload(
   url: string, 
   dest: string, 
-  onProgress?: (progress: number, speed?: number, threads?: number) => void, 
+  onProgress?: (progress: number, speed?: number, threads?: number, totalBytes?: number) => void, 
   onCancel?: () => boolean, 
   onPauseCheck?: () => boolean,
   onRequestCreated?: (req: http.ClientRequest) => void,
@@ -428,7 +428,7 @@ async function tryParallelDownload(
       // 预计剩余时间放大约 1024 倍（几十 KB/s 被显示成几十 B/s、几分钟显示成几十小时）。
       const instant = dt > 0 ? (received - lastBytes) / (dt / 1000) : 0
       speedEwma = speedEwma === 0 ? instant : speedEwma * 0.65 + instant * 0.35
-      onProgress(Math.min(99, Math.round((received / total) * 100)), Math.round(speedEwma), chunkCount)
+      onProgress(Math.min(99, Math.round((received / total) * 100)), Math.round(speedEwma), chunkCount, total)
       lastReport = now
       lastBytes = received
     }
@@ -619,7 +619,7 @@ async function tryParallelDownload(
 async function downloadFileSingle(
   url: string, 
   dest: string, 
-  onProgress?: (progress: number, speed?: number, threads?: number) => void, 
+  onProgress?: (progress: number, speed?: number, threads?: number, totalBytes?: number) => void, 
   onCancel?: () => boolean, 
   onPauseCheck?: () => boolean,
   onRequestCreated?: (req: http.ClientRequest) => void,
@@ -835,7 +835,15 @@ async function downloadFileSingle(
         if (onPauseCheck && onPauseCheck()) {
           response.pause()
           file.cork()
-          
+
+          // 暂停期间不会再有 data 事件，停滞计时器无法被 resetStallTimer() 重置，
+          // 60 秒后会被误判为"下载停滞"并强行中断（挂机下载/锁屏必现）。
+          // 暂停前先清掉计时器，恢复后由下面的 resetStallTimer() 重新武装。
+          if (stalledTimeout) {
+            clearTimeout(stalledTimeout)
+            stalledTimeout = null
+          }
+
           const shouldCancel = await waitForResume()
           if (shouldCancel) {
             cancelled = true
@@ -860,7 +868,7 @@ async function downloadFileSingle(
           // 同样做 EWMA 平滑：限速源的突发 trickle 会让瞬时速度显示成 0
           singleSpeedEwma = singleSpeedEwma === 0 ? instant : singleSpeedEwma * 0.65 + instant * 0.35
           const progress = totalSize > 0 ? Math.round((downloadedSize / totalSize) * 100) : 0
-          onProgress(progress, Math.round(singleSpeedEwma), 1)
+          onProgress(progress, Math.round(singleSpeedEwma), 1, totalSize)
           lastUpdateTime = now
           lastDownloadedSize = downloadedSize
         }
@@ -1030,7 +1038,7 @@ export interface BatchDownloadItem {
   id: string
   url: string
   dest: string
-  onProgress?: (progress: number, speed?: number, threads?: number) => void
+  onProgress?: (progress: number, speed?: number, threads?: number, totalBytes?: number) => void
 }
 
 export async function batchDownload(
@@ -1073,7 +1081,7 @@ export async function batchDownload(
 export async function downloadFile(
   url: string,
   dest: string,
-  onProgress?: (progress: number, speed?: number, threads?: number) => void,
+  onProgress?: (progress: number, speed?: number, threads?: number, totalBytes?: number) => void,
   onCancel?: () => boolean,
   maxRetries: number = 3,
   onPauseCheck?: () => boolean,

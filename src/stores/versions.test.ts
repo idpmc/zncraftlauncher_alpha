@@ -8,7 +8,7 @@
 import { test, describe, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { createPinia, setActivePinia } from 'pinia'
-import { useVersionsStore } from './versions.ts'
+import { useVersionsStore, computeWeightedProgress } from './versions.ts'
 
 describe('下载通知横幅：关闭后不被进度事件复活', () => {
   beforeEach(() => {
@@ -83,5 +83,51 @@ describe('下载通知横幅：关闭后不被进度事件复活', () => {
 
     store.addNotification('1.20.1', '1.20.1', 'downloading', 0, '下载准备中')
     assert.equal(store.notifications.length, 1, '仅关闭 failed 横幅不应屏蔽后续下载横幅')
+  })
+})
+
+describe('下载进度权重：全局监听器与局部监听器必须一致', () => {
+  test('各阶段的起止权重符合设计（json 2% / jar 8% / libraries 40% / assets 50%）', () => {
+    assert.equal(computeWeightedProgress('json', 0), 0)
+    assert.equal(computeWeightedProgress('json', 100), 2)
+
+    assert.equal(computeWeightedProgress('jar', 0), 2)
+    assert.equal(computeWeightedProgress('jar', 100), 10)
+
+    assert.equal(computeWeightedProgress('libraries', 0), 10)
+    assert.equal(computeWeightedProgress('libraries', 100), 50)
+
+    assert.equal(computeWeightedProgress('assets', 0), 50)
+    assert.equal(computeWeightedProgress('assets', 100), 100)
+  })
+
+  test('资源阶段不能归零（回归：全局监听器缺少 assets 分支，刷新后进度会跳回 0）', () => {
+    assert.notEqual(computeWeightedProgress('assets', 50), 0)
+    assert.ok(computeWeightedProgress('assets', 50) > computeWeightedProgress('libraries', 100))
+  })
+
+  test('阶段衔接处进度不回退', () => {
+    const boundaries = [
+      computeWeightedProgress('json', 100),
+      computeWeightedProgress('jar', 0),
+      computeWeightedProgress('jar', 100),
+      computeWeightedProgress('libraries', 0),
+      computeWeightedProgress('libraries', 100),
+      computeWeightedProgress('assets', 0),
+      computeWeightedProgress('assets', 100)
+    ]
+    for (let i = 1; i < boundaries.length; i++) {
+      assert.ok(
+        boundaries[i] >= boundaries[i - 1],
+        `阶段衔接处进度回退了：${boundaries[i - 1]} → ${boundaries[i]}`
+      )
+    }
+  })
+
+  test('越界/异常输入被夹紧，不会产生负进度或超过 100', () => {
+    assert.equal(computeWeightedProgress('json', -10), 0)
+    assert.equal(computeWeightedProgress('assets', 200), 100)
+    assert.equal(computeWeightedProgress('libraries', NaN), 10)
+    assert.equal(computeWeightedProgress('unknown-type', 50), 0)
   })
 })

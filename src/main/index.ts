@@ -11,6 +11,7 @@ import * as net from 'net'
 import { autoUpdater } from 'electron-updater'
 import { downloadFile, downloadPool, formatSpeed, setForceCancelAllDownloads, getForceCancelAllDownloads, resolveRedirectUrl, setDownloadThreads, getDownloadThreads, setModrinthMirrorEnabled, modrinthCandidates } from './download-utils'
 import { initFileLogger, getLogFilePath, getLogDir, readLogsForCopy } from './file-logger'
+import { readVersionJsonSafe, getExpectedClientSize, getExpectedClientSha1, isClientJarUsable, isVersionAssetsReady } from './client-jar-integrity'
 import { mt, setMainLocale } from './locale'
 import { setProxyConfig, getProxyConfig, httpFetch, testProxyConnection, proxyRulesString, proxyBypassString, gameProxyJvmArgs, loadProxyConfigFromFile, saveProxyConfigToFile } from './proxy'
 import { classifyGameStderr, detectGameErrorHint, nativeExitCodeHintKey, createGameLogDecoder, splitLogLines } from '../shared/game-log'
@@ -206,6 +207,8 @@ interface VersionDownloadState {
   paused: boolean
   abortController: { abort: () => void } | null
   currentRequest: http.ClientRequest | null
+  /** 用户主动取消（用于把"取消"和"失败"区分开，避免取消后被报成下载失败） */
+  cancelled?: boolean
 }
 const activeVersionDownloads = new Map<string, VersionDownloadState>()
 
@@ -1238,6 +1241,14 @@ function resolveBaseMcVersion(versionId: string, targetDirName: string): string 
   return versionId
 }
 
+// ========== 客户端 jar 完整性判据（全局统一） ==========
+// 判据实现放在 src/main/client-jar-integrity.ts（与单元测试共用）：
+// 不能用固定的 "1MB" 阈值判断 client.jar 是否缺失 ——
+// 官方清单里有 21 个版本的 client.jar 本身就只有 26KB~876KB（a1.0.16=840KB、
+// c0.0.11a=66KB、rd-132211=26KB …），用 1MB 阈值会让它们永远补不齐、永远启动不了；
+// 而只看体积又无法识别"下载中断留下的截断文件"，会被当成完整文件直接跳过下载。
+// 正解是以版本 json 里的 downloads.client.size（官方体积）为权威判据。
+
 // 启动前确保基础游戏文件存在（整合包缺 client jar 时自动下载）
 async function ensureBaseGameFiles(versionId: string, targetDirName: string, onStatus?: (msg: string) => void): Promise<{ ok: boolean; error?: string; baseMcVersion?: string }> {
   const minecraftDir = getMinecraftDir()
@@ -1245,7 +1256,16 @@ async function ensureBaseGameFiles(versionId: string, targetDirName: string, onS
   const jarFile = path.join(versionsDir, `${targetDirName}.jar`)
   const versionJsonPath = path.join(versionsDir, `${targetDirName}.json`)
 
-  if (fs.existsSync(jarFile) && fs.statSync(jarFile).size >= 50 * 1024) {
+  // 用官方体积判定"是否已就绪"：老版本的 client.jar 本身就 < 1MB，
+  // 用固定阈值会让这些版本永远补不齐（启动时反复报"找不到客户端文件"）
+  const existingVersionJson = readVersionJsonSafe(versionJsonPath)
+  const existingExpectedSize = getExpectedClientSize(existingVersionJson)
+  const jarUsable = isClientJarUsable(jarFile, existingExpectedSize)
+  // 资源（assets）同样要就绪：整合包安装只下了 json + jar，资源完全没下，
+  // 而原来的守卫因为"jar 存在且加载器已合并"不会触发补齐，
+  // 结果整合包会以"零 vanilla 资源"启动（黑紫块 / 缺模型 / 语言回退英文）。
+  const assetsReady = isVersionAssetsReady(existingVersionJson, minecraftDir)
+  if (jarUsable && assetsReady) {
     // jar 已存在：若整合包还需加载器合并，则继续处理（不提前返回）
     const loaderInfo = resolveModpackLoader(targetDirName)
     const needLoader = loaderInfo && (loaderInfo.loader === 'fabric-loader' || loaderInfo.loader === 'quilt-loader' || loaderInfo.loader === 'neoforge' || loaderInfo.loader === 'forge')
@@ -1312,14 +1332,16 @@ async function ensureBaseGameFiles(versionId: string, targetDirName: string, onS
     })
 
     // 整合包需要对应的加载器（Fabric/NeoForge 等）才能真正加载 mod
+    // 若 json 已经合并过加载器（inheritsFrom），说明这是"补资源"场景，不要重跑安装器
     const loaderInfo = resolveModpackLoader(targetDirName)
-    if (loaderInfo && (loaderInfo.loader === 'fabric-loader' || loaderInfo.loader === 'quilt-loader')) {
+    const loaderMerged = !!readVersionJsonSafe(versionJsonPath)?.inheritsFrom
+    if (!loaderMerged && loaderInfo && (loaderInfo.loader === 'fabric-loader' || loaderInfo.loader === 'quilt-loader')) {
       onStatus?.(mt('mc.installingLoader', { loader: loaderInfo.loader, version: loaderInfo.version }))
       const fabricResult = await installFabricLoader(targetDirName, baseMcVersion, loaderInfo.version, onStatus)
       if (!fabricResult.ok) {
         console.warn(`[Main] ${loaderInfo.loader} 安装失败:`, fabricResult.error)
       }
-    } else if (loaderInfo && (loaderInfo.loader === 'neoforge' || loaderInfo.loader === 'forge')) {
+    } else if (!loaderMerged && loaderInfo && (loaderInfo.loader === 'neoforge' || loaderInfo.loader === 'forge')) {
       onStatus?.(mt('mc.installingLoader', { loader: loaderInfo.loader, version: loaderInfo.version }))
       const loaderResult = await installInstallerBasedLoader(loaderInfo.loader, targetDirName, baseMcVersion, loaderInfo.version, onStatus)
       if (!loaderResult.ok) {
@@ -1706,7 +1728,9 @@ async function installFabricLoader(targetDirName: string, baseMcVersion: string,
     }
 
     // 将客户端 jar 复制到基础版本目录（Fabric 通过 inheritsFrom 查找时需要它）
-    if (!fs.existsSync(baseVersionJarPath) || fs.statSync(baseVersionJarPath).size < 1024 * 1024) {
+    // 判定用官方体积：老版本的官方 client.jar 本身就 < 1MB，固定 1MB 阈值会导致永不复制
+    const vanillaClientSize = getExpectedClientSize(vanillaJson)
+    if (!isClientJarUsable(baseVersionJarPath, vanillaClientSize)) {
       const sourceJarCandidates = [
         path.join(versionsDir, `${targetDirName}.jar`),
         path.join(versionsDir, `${baseMcVersion}.jar`)
@@ -1714,7 +1738,7 @@ async function installFabricLoader(targetDirName: string, baseMcVersion: string,
       let sourceJar: string | null = null
       for (const candidate of sourceJarCandidates) {
         try {
-          if (fs.existsSync(candidate) && fs.statSync(candidate).size >= 1024 * 1024) {
+          if (isClientJarUsable(candidate, vanillaClientSize)) {
             sourceJar = candidate
             break
           }
@@ -2131,7 +2155,9 @@ async function installInstallerBasedLoader(
     }
 
     // 将客户端 jar 复制到基础版本目录（NeoForge/Forge 通过 inheritsFrom 查找时需要它）
-    if (!fs.existsSync(baseVersionJarPath) || fs.statSync(baseVersionJarPath).size < 1024 * 1024) {
+    // 判定用官方体积：老版本的官方 client.jar 本身就 < 1MB，固定 1MB 阈值会导致永不复制
+    const vanillaClientSize = getExpectedClientSize(vanillaJson)
+    if (!isClientJarUsable(baseVersionJarPath, vanillaClientSize)) {
       const sourceJarCandidates = [
         path.join(versionsDir, `${targetDirName}.jar`),
         path.join(versionsDir, `${baseMcVersion}.jar`)
@@ -2139,7 +2165,7 @@ async function installInstallerBasedLoader(
       let sourceJar: string | null = null
       for (const candidate of sourceJarCandidates) {
         try {
-          if (fs.existsSync(candidate) && fs.statSync(candidate).size >= 1024 * 1024) {
+          if (isClientJarUsable(candidate, vanillaClientSize)) {
             sourceJar = candidate
             break
           }
@@ -2476,7 +2502,16 @@ ipcMain.handle('launch-game', async (event, versionId: string, username?: string
     const needsFabricMerge = isFabricLikeLoader && (!launchVersionJsonData || !launchVersionJsonData.inheritsFrom)
     const needsLoaderMerge = isInstallerBasedLoader && (!launchVersionJsonData || !launchVersionJsonData.inheritsFrom)
     const needsAnyLoaderMerge = needsFabricMerge || needsLoaderMerge
-    if (!fs.existsSync(jarFile) || fs.statSync(jarFile).size < 50 * 1024 || needsAnyLoaderMerge) {
+    // 客户端 jar 完整性：优先用版本 json 里的官方体积（downloads.client.size）。
+    // 固定 50KB 阈值会误判两类情况：
+    //   a) 官方 jar 本身就小于阈值的老版本（a1.0.16=840KB、c0.0.11a=66KB、rd-132211=26KB…）
+    //      —— 会被当成"没装"而反复重下；官方 jar 大的版本一旦被截断又会被当成完整文件；
+    //   b) 下载中断留下的截断 jar 只要过了阈值就会被当成完整文件，掩盖损坏。
+    const launchExpectedSize = getExpectedClientSize(launchVersionJsonData)
+    // 整合包安装只下了 json + jar，资源（assets）完全没下 →
+    // 启动前必须补齐，否则整合包会以"零 vanilla 资源"启动（黑紫块 / 缺模型 / 语言回退英文）
+    const launchAssetsReady = isVersionAssetsReady(launchVersionJsonData, getMinecraftDir())
+    if (!isClientJarUsable(jarFile, launchExpectedSize) || needsAnyLoaderMerge || !launchAssetsReady) {
       console.log(`[Main] 缺少游戏文件或加载器未安装，尝试自动补齐: ${targetDirName}`)
       event.sender.send('game-launch-status', { versionId: targetDirName, message: mt('mc.missingGameFilesFilling') })
       const ensureResult = await ensureBaseGameFiles(versionId, targetDirName, (msg) => {
@@ -2862,12 +2897,20 @@ ipcMain.handle('launch-game', async (event, versionId: string, username?: string
 
     // 最终兜底：客户端 jar 必须存在，否则启动必然报 "Could not find main class"
     // （如 json 存在但 jar 缺失/过小、下载被跳过等中间状态）。缺失时自动补齐一次
-    if (!fs.existsSync(jarFile) || fs.statSync(jarFile).size < 1024 * 1024) {
-      console.log(`[Main] 客户端 jar 缺失/过小，启动前自动补齐: ${jarFile}`)
+    // 客户端 jar 完整性：优先用版本 json 里的官方体积（downloads.client.size）。
+    // 固定 1MB 阈值有两个问题：
+    //   a) 官方清单里有 21 个版本的 client.jar 本身就 < 1MB（a1.0.16=840KB、c0.0.11a=66KB…），
+    //      用 1MB 判据会让它们永远补不齐、永远启动不了（且提示"请重新下载"是误导）；
+    //   b) 下载中断留下的截断 jar 只要 > 1MB 就会被当成完整文件，掩盖损坏。
+    const expectedClientSize = getExpectedClientSize(versionJson)
+    if (!isClientJarUsable(jarFile, expectedClientSize)) {
+      console.log(`[Main] 客户端 jar 缺失/不完整，启动前自动补齐: ${jarFile}`)
       const ensureResult = await ensureBaseGameFiles(versionId, targetDirName, (msg) => {
         event.sender.send('game-launch-status', { versionId: targetDirName, message: msg })
       })
-      if (!ensureResult.ok || !fs.existsSync(jarFile) || fs.statSync(jarFile).size < 1024 * 1024) {
+      // 补齐后按最新 json 重新复核（json 可能刚被重下，体积基准要跟着更新）
+      const afterEnsureSize = getExpectedClientSize(readVersionJsonSafe(versionJsonPath)) ?? expectedClientSize
+      if (!ensureResult.ok || !isClientJarUsable(jarFile, afterEnsureSize)) {
         return {
           success: false,
           error: mt('mc.clientJarMissing', { path: jarFile })
@@ -5004,7 +5047,15 @@ async function downloadModpackFiles(versionsDir: string, onProgress?: (done: num
 
 // 内部函数：下载并安装基础游戏文件（版本json + client jar + 依赖库 + 资源）
 // 供 download-version 与整合包安装共用
-async function installBaseVersion(versionId: string, versionUrl: string, targetDirName: string, isPaused: () => boolean, sendProgress: (type: string, progress: number) => void): Promise<void> {
+async function installBaseVersion(
+  versionId: string,
+  versionUrl: string,
+  targetDirName: string,
+  isPaused: () => boolean,
+  sendProgress: (type: string, progress: number, speed?: number, totalBytes?: number, downloadedBytes?: number) => void,
+  onRequestCreated?: (req: http.ClientRequest) => void,
+  isCancelled?: () => boolean
+): Promise<void> {
   const minecraftDir = getMinecraftDir()
   const versionsDir = path.join(minecraftDir, 'versions', targetDirName)
 
@@ -5016,6 +5067,38 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
 
   const versionJsonPath = path.join(versionsDir, `${targetDirName}.json`)
   const clientJarPath = path.join(versionsDir, `${targetDirName}.jar`)
+
+  // ---------- 版本级字节统计（供下载面板显示速度 / 已下载 / 总量 / 剩余时间） ----------
+  // 每个阶段的总量在"该阶段开始"时才知道（jar 用官方 size，库用 json 里的 artifact.size，
+  // 资源用索引里的对象 size），已下载量按阶段进度百分比折算。
+  const phaseStats = new Map<string, { total: number; done: number }>()
+  const refreshByteStats = () => {
+    let total = 0
+    let done = 0
+    for (const s of phaseStats.values()) {
+      total += s.total
+      done += s.done
+    }
+    return { total, done }
+  }
+  /** 记录某阶段的总量（未知时传 0） */
+  const setPhaseTotal = (type: string, total: number) => {
+    const cur = phaseStats.get(type) || { total: 0, done: 0 }
+    if (total > 0) cur.total = total
+    phaseStats.set(type, cur)
+  }
+  /** 按阶段进度更新已下载字节 */
+  const setPhaseProgress = (type: string, progress: number, fileTotalBytes?: number) => {
+    const cur = phaseStats.get(type) || { total: 0, done: 0 }
+    if (fileTotalBytes && fileTotalBytes > 0) cur.total = fileTotalBytes
+    cur.done = cur.total > 0 ? Math.round((cur.total * Math.min(100, Math.max(0, progress))) / 100) : cur.done
+    phaseStats.set(type, cur)
+  }
+  /** 统一上报：带上速度与字节数（前端据此渲染速度 / 已下载 / 总量 / ETA） */
+  const reportProgress = (type: string, progress: number, speed = 0) => {
+    const { total, done } = refreshByteStats()
+    sendProgress(type, progress, speed, total, done)
+  }
 
   // 生成带国内镜像的 URL 列表（优先官方源，镜像作为 fallback）
   function getMirrorUrls(originalUrl: string, type: 'json' | 'jar'): string[] {
@@ -5040,15 +5123,22 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
     return orderByDownloadSource([...new Set(urls)])
   }
 
-  const downloadWithMirrors = async (url: string, dest: string, type: 'json' | 'jar', sendType: string) => {
+  const downloadWithMirrors = async (
+    url: string,
+    dest: string,
+    type: 'json' | 'jar',
+    sendType: string,
+    expectedSha1?: string
+  ) => {
     const mirrorUrls = getMirrorUrls(url, type)
     let lastError: any = null
     for (let i = 0; i < mirrorUrls.length; i++) {
       try {
         console.log(`[Main] 尝试下载${type} (${i + 1}/${mirrorUrls.length}): ${mirrorUrls[i]}`)
-        await downloadFile(mirrorUrls[i], dest, (progress) => {
-          sendProgress(sendType, progress)
-        }, undefined, 1, isPaused)
+        await downloadFile(mirrorUrls[i], dest, (progress, speed, _threads, totalBytes) => {
+          setPhaseProgress(sendType, progress, totalBytes)
+          reportProgress(sendType, progress, speed || 0)
+        }, isCancelled, 1, isPaused, onRequestCreated, true, 0, expectedSha1)
         return true
       } catch (err: any) {
         lastError = err
@@ -5062,7 +5152,7 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
   }
 
   // 发送初始进度事件，确保前端能收到下载开始的通知
-  sendProgress('json', 0)
+  reportProgress('json', 0)
 
   // 版本配置已存在且可解析时跳过下载（避免重复下载并覆盖已合并的加载器 json）
   const versionJsonExists = fs.existsSync(versionJsonPath) && (() => {
@@ -5095,14 +5185,21 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
   }
 
   if (clientUrl) {
-    // 客户端 jar 已存在且大小合理时跳过下载
-    const clientJarExists = fs.existsSync(clientJarPath) && fs.statSync(clientJarPath).size >= 1024 * 1024
-    if (!clientJarExists) {
-      await downloadWithMirrors(clientUrl, clientJarPath, 'jar', 'jar')
-      console.log(`[Main] 客户端 JAR 下载完成`)
-    } else {
+    // 客户端 jar 是否已就绪：以官方体积 downloads.client.size 为准。
+    // 1) 能识别"下载中断留下的截断文件"，避免被当成完整文件永久跳过下载；
+    // 2) 老版本的官方 jar 本身就 < 1MB，用固定 1MB 判据会让它们永远补不齐。
+    const expectedSize = getExpectedClientSize(versionJson)
+    const expectedSha1 = getExpectedClientSha1(versionJson)
+    setPhaseTotal('jar', expectedSize || 0)
+    if (isClientJarUsable(clientJarPath, expectedSize)) {
       console.log(`[Main] 客户端 JAR 已存在，跳过下载`)
+    } else {
+      // 带 sha1 校验：镜像中途断流产生的截断 jar 会被挡下并自动换源重试
+      await downloadWithMirrors(clientUrl, clientJarPath, 'jar', 'jar', expectedSha1)
+      console.log(`[Main] 客户端 JAR 下载完成`)
     }
+    setPhaseProgress('jar', 100)
+    reportProgress('jar', 100)
   } else {
     console.warn(`[Main] 无法获取客户端下载地址: ${targetDirName}`)
   }
@@ -5123,13 +5220,18 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
       'https://maven.aliyun.com/repository/public/'
     ])
 
-    const downloadLibWithFallback = async (libPath: string, libUrl: string, sha1?: string) => {
+    const downloadLibWithFallback = async (
+      libPath: string,
+      libUrl: string,
+      sha1?: string,
+      onProgress?: (progress: number, speed?: number, threads?: number, totalBytes?: number) => void
+    ) => {
       const pathPart = libUrl.replace('https://libraries.minecraft.net/', '')
       for (let baseIndex = 0; baseIndex < libraryUrlBases.length; baseIndex++) {
         const url = `${libraryUrlBases[baseIndex]}${pathPart}`
         try {
           // 带 SHA-1 校验：镜像/官方中途断流产生的截断 jar 会被挡下并换源重试
-          await downloadFile(url, libPath, undefined, undefined, 3, isPaused, undefined, true, 0, sha1)
+          await downloadFile(url, libPath, onProgress, isCancelled, 3, isPaused, undefined, true, 0, sha1)
           return true
         } catch (err: any) {
           if (err.message && err.message.includes('状态码: 404')) {
@@ -5144,10 +5246,10 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
     }
 
     // 构建下载任务列表（库 jar + natives），然后并发下载提速
-    const libTasks: { libPath: string; libUrl: string; sha1?: string }[] = []
+    const libTasks: { libPath: string; libUrl: string; sha1?: string; size?: number }[] = []
     for (const lib of allowedLibs) {
       if (lib.downloads && lib.downloads.artifact) {
-        libTasks.push({ libPath: path.join(librariesDir, lib.downloads.artifact.path), libUrl: lib.downloads.artifact.url, sha1: lib.downloads.artifact.sha1 })
+        libTasks.push({ libPath: path.join(librariesDir, lib.downloads.artifact.path), libUrl: lib.downloads.artifact.url, sha1: lib.downloads.artifact.sha1, size: lib.downloads.artifact.size })
       }
       if (lib.natives && lib.downloads && lib.downloads.classifiers) {
         const nativesKey = lib.natives
@@ -5160,22 +5262,31 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
           const nativeClassifier = nativeKey.replace('${arch}', arch)
           const nativeArtifact = lib.downloads.classifiers[nativeClassifier]
           if (nativeArtifact) {
-            libTasks.push({ libPath: path.join(librariesDir, nativeArtifact.path), libUrl: nativeArtifact.url, sha1: nativeArtifact.sha1 })
+            libTasks.push({ libPath: path.join(librariesDir, nativeArtifact.path), libUrl: nativeArtifact.url, sha1: nativeArtifact.sha1, size: nativeArtifact.size })
           }
         }
       }
     }
 
+    // 依赖库总体积（用于下载面板显示总量/已下载/剩余时间）
+    const libTotalBytes = libTasks.reduce((sum, t) => sum + (t.size || 0), 0)
+    setPhaseTotal('libraries', libTotalBytes)
+
     // 并发下载库文件（默认 16 个并行）
     const LIB_MAX_CONCURRENT = 16
     let libCursor = 0
     let libFailedCount = 0
+    // 字节统计：已存在的库直接计入"已下载"，正在下载的按 onProgress 累计真实字节
+    let libPresentBytes = 0
+    let libDownloadedBytes = 0
     const libFailedTasks: typeof libTasks = []
     const libWorker = async () => {
       while (libCursor < libTasks.length) {
         while (isPaused()) {
+          if (isCancelled?.()) throw new Error('下载已取消')
           await new Promise(resolve => setTimeout(resolve, 200))
         }
+        if (isCancelled?.()) throw new Error('下载已取消')
         const task = libTasks[libCursor++]
         if (!task) break
 
@@ -5186,7 +5297,17 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
 
         if (!fs.existsSync(task.libPath)) {
           try {
-            const success = await downloadLibWithFallback(task.libPath, task.libUrl, task.sha1)
+            let lastItemBytes = 0
+            const success = await downloadLibWithFallback(task.libPath, task.libUrl, task.sha1, (progress, _speed, _threads, totalBytes) => {
+              const size = totalBytes || task.size || 0
+              if (!size) return
+              const nowBytes = Math.round((Math.min(100, Math.max(0, progress)) / 100) * size)
+              const delta = nowBytes - lastItemBytes
+              if (delta > 0) {
+                lastItemBytes = nowBytes
+                libDownloadedBytes += delta
+              }
+            })
             if (!success) {
               console.warn(`[Main] 下载库失败(已尝试所有源): ${task.libPath}`)
               libFailedTasks.push(task)
@@ -5195,11 +5316,18 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
             libFailedTasks.push(task)
             console.warn(`[Main] 下载库失败: ${task.libPath}`, err)
           }
+        } else {
+          try { libPresentBytes += fs.statSync(task.libPath).size } catch {}
         }
 
         downloadedLibs++
         const libProgress = Math.round((downloadedLibs / totalLibs) * 100)
-        sendProgress('libraries', libProgress)
+        const phase = phaseStats.get('libraries')
+        if (phase) {
+          if (libTotalBytes > 0) phase.total = libTotalBytes
+          phase.done = Math.round(libPresentBytes + libDownloadedBytes)
+        }
+        reportProgress('libraries', libProgress)
       }
     }
     await Promise.all(Array(Math.min(LIB_MAX_CONCURRENT, libTasks.length)).fill(null).map(libWorker))
@@ -5243,7 +5371,7 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
 
     const indexFile = path.join(indexesDir, `${versionJson.assetIndex.id}.json`)
     if (!fs.existsSync(indexFile)) {
-      await downloadFile(versionJson.assetIndex.url, indexFile, undefined, undefined, 3, isPaused)
+      await downloadFile(versionJson.assetIndex.url, indexFile, undefined, isCancelled, 3, isPaused)
       console.log(`[Main] 资源索引下载完成`)
     }
 
@@ -5289,15 +5417,45 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
 
         console.log(`[Main] 需要下载 ${assetsToDownload.length} 个资源文件`)
 
+        // 资源总体积：已存在的对象算作已完成，缺失的按待下载总量计
+        // （用于下载面板显示总量 / 已下载 / 剩余时间）
+        const assetsToDownloadBytes = assetsToDownload.reduce((sum, a) => sum + (a.size || 0), 0)
+        const assetsPresentBytes = assetObjects.reduce((sum, [, info]) => {
+          const sz = (info as any)?.size || 0
+          return sum + sz
+        }, 0) - assetsToDownloadBytes
+        setPhaseTotal('assets', assetsPresentBytes + assetsToDownloadBytes)
+        // 已存在的对象直接计入"已下载"，否则下载面板上的字节数会从 0 突然跳变
+        const assetsPhase = phaseStats.get('assets') || { total: 0, done: 0 }
+        assetsPhase.total = assetsPresentBytes + assetsToDownloadBytes
+        assetsPhase.done = assetsPresentBytes
+        phaseStats.set('assets', assetsPhase)
+
         // 资源多为小文件，并发上限调高以接近 PCL 的下载速度
         const maxConcurrent = 24
         let completedCount = 0
+        // 已存在的资源数（进度分母是资源总数，不是待下载数，否则进度永远到不了 100%）
+        const assetsPresentCount = totalAssets - assetsToDownload.length
+        // 实际下载到的字节数（按每个文件的 onProgress 累计，而不是按数量比例估算）
+        let assetsDownloadedBytes = 0
+        let lastAssetsReportTime = 0
         const downloadQueue = [...assetsToDownload]
         const assetFailedItems: typeof assetsToDownload = []
+
+        const reportAssetsProgress = (force = false) => {
+          const now = Date.now()
+          if (!force && now - lastAssetsReportTime < 200) return
+          lastAssetsReportTime = now
+          const assetProgress = Math.round(((assetsPresentCount + completedCount) / Math.max(1, totalAssets)) * 100)
+          const phase = phaseStats.get('assets')
+          if (phase) phase.done = Math.round(assetsPresentBytes + assetsDownloadedBytes)
+          reportProgress('assets', Math.min(100, assetProgress))
+        }
 
         const downloadAssetWithFallback = async (item: typeof assetsToDownload[0]) => {
           const subDir = item.hash.substring(0, 2)
           let all404 = true
+          let lastItemBytes = 0
           for (let baseIndex = 0; baseIndex < assetUrlBases.length; baseIndex++) {
             const base = assetUrlBases[baseIndex]
             const usesSubDir = base.includes('minecraft.net')
@@ -5307,7 +5465,16 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
             try {
               // 资源对象以 SHA-1 命名，下载后强制校验哈希：
               // 服务器中途断流会产出「截断但看起来成功」的文件，不校验就会留下坏 PNG/坏语言文件
-              await downloadFile(url, item.path, undefined, undefined, 3, isPaused, undefined, true, item.size, item.hash)
+              await downloadFile(url, item.path, (progress, _speed, _threads, totalBytes) => {
+                const size = totalBytes || item.size || 0
+                if (!size) return
+                const nowBytes = Math.round((Math.min(100, Math.max(0, progress)) / 100) * size)
+                const delta = nowBytes - lastItemBytes
+                if (delta > 0) {
+                  lastItemBytes = nowBytes
+                  assetsDownloadedBytes += delta
+                }
+              }, isCancelled, 3, isPaused, undefined, true, item.size, item.hash)
               return true
             } catch (err: any) {
               if (err.message && err.message.includes('404')) {
@@ -5328,8 +5495,10 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
         const downloadNext = async () => {
           while (downloadQueue.length > 0) {
             while (isPaused()) {
+              if (isCancelled?.()) throw new Error('下载已取消')
               await new Promise(resolve => setTimeout(resolve, 200))
             }
+            if (isCancelled?.()) throw new Error('下载已取消')
 
             const item = downloadQueue.pop()
             if (!item) break
@@ -5345,9 +5514,12 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
 
             completedCount++
             if (completedCount % 50 === 0 || completedCount === assetsToDownload.length) {
-              const assetProgress = Math.round((completedCount / totalAssets) * 100)
-              console.log(`[Main] 资源下载进度: ${completedCount}/${totalAssets} (${assetProgress}%)`)
-              sendProgress('assets', assetProgress)
+              const assetProgress = Math.round(((assetsPresentCount + completedCount) / Math.max(1, totalAssets)) * 100)
+              console.log(`[Main] 资源下载进度: ${completedCount}/${assetsToDownload.length} (${assetProgress}%)`)
+              reportAssetsProgress(true)
+            } else {
+              // 按真实字节数上报（节流 200ms），下载面板的"已下载/总量/剩余时间"才有意义
+              reportAssetsProgress()
             }
           }
         }
@@ -5390,7 +5562,15 @@ async function installBaseVersion(versionId: string, versionUrl: string, targetD
 
 // 轻量版基础游戏下载：只下载 jar + JSON，不下载 libraries/assets（延迟到启动时补全）
 // 用于整合包安装阶段，大幅缩短安装时间
-async function installBaseVersionLight(versionId: string, versionUrl: string, targetDirName: string, isPaused: () => boolean, sendProgress: (type: string, progress: number) => void): Promise<void> {
+async function installBaseVersionLight(
+  versionId: string,
+  versionUrl: string,
+  targetDirName: string,
+  isPaused: () => boolean,
+  sendProgress: (type: string, progress: number, speed?: number) => void,
+  onRequestCreated?: (req: http.ClientRequest) => void,
+  isCancelled?: () => boolean
+): Promise<void> {
   const minecraftDir = getMinecraftDir()
   const versionsDir = path.join(minecraftDir, 'versions', targetDirName)
   if (!fs.existsSync(versionsDir)) fs.mkdirSync(versionsDir, { recursive: true })
@@ -5421,12 +5601,12 @@ async function installBaseVersionLight(versionId: string, versionUrl: string, ta
     return orderByDownloadSource([...new Set(urls)])
   }
 
-  const downloadWithMirrors = async (url: string, dest: string, type: 'json' | 'jar', sendType: string) => {
+  const downloadWithMirrors = async (url: string, dest: string, type: 'json' | 'jar', sendType: string, expectedSha1?: string) => {
     const mirrorUrls = getMirrorUrls(url, type)
     let lastError: any = null
     for (let i = 0; i < mirrorUrls.length; i++) {
       try {
-        await downloadFile(mirrorUrls[i], dest, (progress) => sendProgress(sendType, progress), undefined, 1, isPaused)
+        await downloadFile(mirrorUrls[i], dest, (progress, speed) => sendProgress(sendType, progress, speed || 0), isCancelled, 1, isPaused, onRequestCreated, true, 0, expectedSha1)
         return true
       } catch (err: any) {
         lastError = err
@@ -5464,11 +5644,14 @@ async function installBaseVersionLight(versionId: string, versionUrl: string, ta
     }
   }
 
-  // 下载客户端 jar（如果不存在或太小）
+  // 下载客户端 jar（以官方体积判定是否已就绪，老版本官方 jar 本身 < 1MB）
   if (clientUrl) {
-    const clientJarExists = fs.existsSync(clientJarPath) && fs.statSync(clientJarPath).size >= 1024 * 1024
-    if (!clientJarExists) {
-      await downloadWithMirrors(clientUrl, clientJarPath, 'jar', 'jar')
+    const expectedSize = getExpectedClientSize(versionJson)
+    const expectedSha1 = getExpectedClientSha1(versionJson)
+    if (isClientJarUsable(clientJarPath, expectedSize)) {
+      console.log(`[Main] 客户端 JAR 已存在，跳过下载`)
+    } else {
+      await downloadWithMirrors(clientUrl, clientJarPath, 'jar', 'jar', expectedSha1)
       console.log(`[Main] 客户端 JAR 下载完成`)
     }
   } else {
@@ -5513,10 +5696,13 @@ ipcMain.handle('download-version', async (event, versionId: string, versionUrl: 
         const testRead = fs.readFileSync(versionJsonPath, 'utf-8')
         const versionJson = JSON.parse(testRead)
 
-        // 检查 JAR 文件大小是否合理（至少 1MB）
-        const jarStats = fs.statSync(clientJarPath)
-        if (jarStats.size < 1024 * 1024) {
-          console.warn(`[Main] JAR 文件过小，重新下载: ${targetDirName}`)
+        // 以官方体积（downloads.client.size）判定 jar 是否完整。
+        // 固定 1MB 阈值有两个问题：
+        //   a) 老版本的官方 jar 本身就 < 1MB（21 个版本），会被永远当成"不完整"反复重下；
+        //   b) 下载中断留下的截断 jar 只要 > 1MB 就会被当成完整文件永久跳过下载。
+        const expectedSize = getExpectedClientSize(versionJson)
+        if (!isClientJarUsable(clientJarPath, expectedSize)) {
+          console.warn(`[Main] JAR 文件不完整，重新下载: ${targetDirName}`)
         } else {
           console.log(`[Main] 版本 ${targetDirName} 已存在且完整，跳过下载`)
           activeVersionDownloads.delete(targetDirName)
@@ -5527,11 +5713,17 @@ ipcMain.handle('download-version', async (event, versionId: string, versionUrl: 
       }
     }
 
-    const sendProgress = (type: string, progress: number) => {
-      win?.webContents.send('download-progress', { versionId: targetDirName, type, progress })
+    const sendProgress = (type: string, progress: number, speed = 0, totalBytes = 0, downloadedBytes = 0) => {
+      win?.webContents.send('download-progress', { versionId: targetDirName, type, progress, speed, totalBytes, downloadedBytes })
     }
 
-    await installBaseVersion(versionId, versionUrl, targetDirName, isPaused, sendProgress)
+    // 把底层 HTTP 请求交给 downloadState，cancel-download 才能真正中断流
+    const onRequestCreated = (req: http.ClientRequest) => {
+      downloadState.currentRequest = req
+    }
+    const isCancelled = () => downloadState.cancelled === true
+
+    await installBaseVersion(versionId, versionUrl, targetDirName, isPaused, sendProgress, onRequestCreated, isCancelled)
 
     activeVersionDownloads.delete(targetDirName)
     win?.webContents.send('download-complete', { versionId: targetDirName, success: true })
@@ -5539,7 +5731,38 @@ ipcMain.handle('download-version', async (event, versionId: string, versionUrl: 
   } catch (error: any) {
     console.error('[Main] 下载版本失败:', error)
     const targetDirName = directoryName || versionId
+    const wasCancelled = activeVersionDownloads.get(targetDirName)?.cancelled === true
     activeVersionDownloads.delete(targetDirName)
+
+    // 用户主动取消：不报"失败"，避免把已取消的任务显示成下载错误
+    if (wasCancelled) {
+      console.log(`[Main] 版本下载已取消: ${targetDirName}`)
+      return { success: false, cancelled: true, error: mt('mc.downloadCancelled') }
+    }
+
+    // 清理失败留下的半成品，避免下次重试命中"已存在且完整，跳过下载"而静默损坏
+    try {
+      const minecraftDir = getMinecraftDir()
+      const versionsDir = path.join(minecraftDir, 'versions', targetDirName)
+      const versionJsonPath = path.join(versionsDir, `${targetDirName}.json`)
+      const clientJarPath = path.join(versionsDir, `${targetDirName}.jar`)
+
+      // 1) json 存在但解析失败 → 删掉，下次会重新下载
+      if (fs.existsSync(versionJsonPath) && !readVersionJsonSafe(versionJsonPath)) {
+        console.warn(`[Main] 清理损坏的版本 json: ${versionJsonPath}`)
+        try { fs.unlinkSync(versionJsonPath) } catch {}
+      }
+      // 2) jar 存在但体积不足官方体积 → 截断文件，删掉
+      const json = readVersionJsonSafe(versionJsonPath)
+      const expectedSize = getExpectedClientSize(json)
+      if (fs.existsSync(clientJarPath) && !isClientJarUsable(clientJarPath, expectedSize)) {
+        console.warn(`[Main] 清理不完整的客户端 jar: ${clientJarPath}`)
+        try { fs.unlinkSync(clientJarPath) } catch {}
+      }
+    } catch (e) {
+      console.warn('[Main] 清理下载残留失败:', e)
+    }
+
     win?.webContents.send('download-complete', { versionId: targetDirName, success: false, error: error.message || mt('mc.downloadFailedShort') })
     return { success: false, error: error.message || mt('mc.downloadFailedShort') }
   }
@@ -5591,17 +5814,39 @@ ipcMain.handle('cancel-download', async (event, versionId: string) => {
       return { success: false, error: mt('mc.noActiveDownloadTask') }
     }
     
+    // 先标记取消：底层下载循环与 downloadFile 的 onCancel 都会检查这个标记，
+    // 即使当前没有活跃的 HTTP 请求（比如正处在库/资源循环里）也能退出。
+    download.cancelled = true
+
     if (download.currentRequest) {
-      download.currentRequest.destroy()
+      try { download.currentRequest.destroy() } catch {}
+      download.currentRequest = null
     }
-    activeVersionDownloads.delete(versionId)
     console.log(`[Main] 取消下载: ${versionId}`)
-    
+
+    // 不在这里删除 activeVersionDownloads 条目：由下载协程退出时统一清理。
+    // 提前删锁会让同一目录被并发开第二条下载链路（两个写者同时写同一个 jar/json）。
     win?.webContents.send('download-cancelled', { versionId })
     return { success: true }
   } catch (error: any) {
     console.error('[Main] 取消下载失败:', error)
     return { success: false, error: error.message || mt('mc.cancelFailed') }
+  }
+})
+
+// 获取当前仍在进行中的版本下载列表（渲染层刷新后用来恢复下载状态）
+ipcMain.handle('get-active-downloads', async () => {
+  try {
+    return {
+      success: true,
+      downloads: Array.from(activeVersionDownloads.values()).map(d => ({
+        versionId: d.versionId,
+        paused: d.paused
+      }))
+    }
+  } catch (error: any) {
+    console.error('[Main] 获取活动下载列表失败:', error)
+    return { success: false, downloads: [] }
   }
 })
 
@@ -5615,6 +5860,7 @@ ipcMain.handle('force-reset-downloads', async (event) => {
     
     // 销毁所有版本下载
     for (const [versionId, download] of activeVersionDownloads) {
+      download.cancelled = true
       if (download.currentRequest) {
         try {
           download.currentRequest.destroy()
@@ -6119,12 +6365,14 @@ ipcMain.handle('install-modpack', async (event, modId: string, modName: string, 
 
     // 检查客户端 jar 和版本 JSON 是否有效
     const clientJarPath = path.join(versionsDir, `${safeVersionId}.jar`)
+    const jsonCheckPath = path.join(versionsDir, `${safeVersionId}.json`)
+    // jar 有效性以官方体积判定：整合包的目标 MC 版本可能是老版本，
+    // 官方 client.jar 本身就 < 1MB，固定 1MB 阈值会判成"无效"而反复重下
     const clientJarValid = (() => {
       try {
-        return fs.existsSync(clientJarPath) && fs.statSync(clientJarPath).size >= 1024 * 1024
+        return isClientJarUsable(clientJarPath, getExpectedClientSize(readVersionJsonSafe(jsonCheckPath)))
       } catch { return false }
     })()
-    const jsonCheckPath = path.join(versionsDir, `${safeVersionId}.json`)
     const versionJsonValid = (() => {
       try {
         if (!fs.existsSync(jsonCheckPath)) return false
@@ -6162,12 +6410,16 @@ ipcMain.handle('install-modpack', async (event, modId: string, modName: string, 
         let baseDownloadOk = false
         try {
           // 只下载 jar + JSON（不下载 libraries/assets，启动时补全）
-          await installBaseVersionLight(baseMcVersion, versionMetaUrl, safeVersionId, () => false, (type, progress) => {
+          await installBaseVersionLight(baseMcVersion, versionMetaUrl, safeVersionId, () => false, (type, progress, speed) => {
             const base = 60
             const range = 15
             const pct = type === 'assets' ? base + range : base + Math.round((progress / 100) * range)
-            event.sender.send('mod-download-progress', { modId, progress: Math.min(75, pct), speed: 0 })
-          })
+            event.sender.send('mod-download-progress', { modId, progress: Math.min(75, pct), speed: speed || 0 })
+          }, (req) => {
+            // 让 cancel-mod-download 能真正中断基础游戏文件的下载
+            const st = activeModpackDownloads.get(modId)
+            if (st) st.currentRequest = req
+          }, () => activeModpackDownloads.get(modId)?.cancelled === true)
           baseDownloadOk = true
           console.log(`[Main] 整合包基础游戏文件下载完成: ${baseMcVersion}`)
 
@@ -6386,7 +6638,8 @@ ipcMain.handle('scan-installed-versions', async () => {
       let jarSize = 0
       if (fs.existsSync(clientJarPath)) {
         jarSize = fs.statSync(clientJarPath).size
-        hasJar = jarSize >= 50 * 1024
+        // 以官方体积判定（老版本官方 jar 本身可能只有几十 KB，固定阈值会误判）
+        hasJar = isClientJarUsable(clientJarPath, getExpectedClientSize(readVersionJsonSafe(versionJsonPath)))
       }
 
       // 整合包目录：有 modrinth.index.json 即视为已安装
@@ -6472,7 +6725,12 @@ ipcMain.handle('check-version-installed', async (_event, versionId: string, dire
 
     const jsonExists = fs.existsSync(versionJsonPath)
     const jarExists = fs.existsSync(clientJarPath)
-    const jarValid = jarExists ? fs.statSync(clientJarPath).size >= 50 * 1024 : false
+    // 以官方体积（downloads.client.size）判定 jar 是否有效：
+    // 固定 50KB 阈值会把官方 jar 本身就小于 50KB 的老版本判成"未安装"，
+    // 而 50KB~1MB 之间的截断 jar 又会被当成完整文件。
+    const jarValid = jarExists
+      ? isClientJarUsable(clientJarPath, getExpectedClientSize(readVersionJsonSafe(versionJsonPath)))
+      : false
 
     let reason = ''
     if (!jsonExists && !isModpack) reason = mt('mc.jsonFileMissing')
