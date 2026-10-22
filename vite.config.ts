@@ -10,12 +10,18 @@ const APP_VERSION: string = pkg.version
 const APP_VERSION_CORE = APP_VERSION.split('-')[0]
 const APP_LABEL = APP_VERSION.includes('-') ? `Alpha ${APP_VERSION_CORE}` : APP_VERSION_CORE
 
-// 是否启用「原版游戏本体下载」能力（A 阶段：运行时开关）。
-// 国内发行版（npm run build）为 false：界面无下载入口，相关分支在打包时被死代码消除。
-// 注意（如实描述）：这是运行时/构建期开关，源码与产物中仍包含下载相关代码，
-// 不得对外宣称"反编译找不到下载逻辑"。真正的物理剔除见 docs/合规整改清单.md 的 B 阶段。
-// 开源开发版（npm run build:intl）显式置 true 才开启。
-const ENABLE_MC_DOWNLOAD = process.env.ZNCL_MC_DOWNLOAD === '1'
+// vite-plugin-electron 会为主进程 / preload 各跑一次独立的 Vite 构建，
+// 它构造的子配置（resolveViteConfig）**不继承**根配置的 define。
+// 所以这些常量必须显式注入到每个子构建，否则 out/main/index.js 里
+// 会残留裸的 __APP_VERSION__ 之类的标识符，运行时抛
+// "ReferenceError: __APP_VERSION__ is not defined"。
+function buildDefines() {
+  return {
+    __APP_VERSION__: JSON.stringify(APP_VERSION),
+    __APP_VERSION_CORE__: JSON.stringify(APP_VERSION_CORE),
+    __APP_LABEL__: JSON.stringify(APP_LABEL)
+  }
+}
 
 // index.html 的 <title> 拿不到 define 注入的常量，用占位符在这里替换
 function htmlVersionPlugin(): Plugin {
@@ -30,12 +36,7 @@ function htmlVersionPlugin(): Plugin {
 }
 
 export default defineConfig({
-  define: {
-    __APP_VERSION__: JSON.stringify(APP_VERSION),
-    __APP_VERSION_CORE__: JSON.stringify(APP_VERSION_CORE),
-    __APP_LABEL__: JSON.stringify(APP_LABEL),
-    __ENABLE_MC_DOWNLOAD__: JSON.stringify(ENABLE_MC_DOWNLOAD)
-  },
+  define: buildDefines(),
   plugins: [
     htmlVersionPlugin(),
     vue(),
@@ -43,6 +44,7 @@ export default defineConfig({
       {
         entry: 'src/main/index.ts',
         vite: {
+          define: buildDefines(),
           build: {
             outDir: 'out/main',
             rollupOptions: {
@@ -57,6 +59,7 @@ export default defineConfig({
           options.reload()
         },
         vite: {
+          define: buildDefines(),
           build: {
             outDir: 'out/preload',
             rollupOptions: {

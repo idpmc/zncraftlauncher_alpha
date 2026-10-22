@@ -2477,13 +2477,6 @@ ipcMain.handle('launch-game', async (event, versionId: string, username?: string
     const needsLoaderMerge = isInstallerBasedLoader && (!launchVersionJsonData || !launchVersionJsonData.inheritsFrom)
     const needsAnyLoaderMerge = needsFabricMerge || needsLoaderMerge
     if (!fs.existsSync(jarFile) || fs.statSync(jarFile).size < 50 * 1024 || needsAnyLoaderMerge) {
-      // 国内发行版：不代用户获取本体/加载器，直接给出导入指引
-      if (!__ENABLE_MC_DOWNLOAD__) {
-        return {
-          success: false,
-          error: mt('mc.downloadDisabledMissing', { path: jarFile })
-        }
-      }
       console.log(`[Main] 缺少游戏文件或加载器未安装，尝试自动补齐: ${targetDirName}`)
       event.sender.send('game-launch-status', { versionId: targetDirName, message: mt('mc.missingGameFilesFilling') })
       const ensureResult = await ensureBaseGameFiles(versionId, targetDirName, (msg) => {
@@ -2537,8 +2530,7 @@ ipcMain.handle('launch-game', async (event, versionId: string, username?: string
 
         // 启动前补齐缺失库文件（含加载器模块路径 -p 引用的库），
         // 否则会报 Unknown module / ClassNotFoundException: BootstrapLauncher
-        // 国内发行版跳过：不代用户拉取本体库文件
-        if (__ENABLE_MC_DOWNLOAD__) try {
+        try {
           const libRepair = await ensureVersionLibraries(versionJson, (msg) => {
             event.sender.send('game-launch-status', { versionId: targetDirName, message: msg })
           })
@@ -2871,13 +2863,6 @@ ipcMain.handle('launch-game', async (event, versionId: string, username?: string
     // 最终兜底：客户端 jar 必须存在，否则启动必然报 "Could not find main class"
     // （如 json 存在但 jar 缺失/过小、下载被跳过等中间状态）。缺失时自动补齐一次
     if (!fs.existsSync(jarFile) || fs.statSync(jarFile).size < 1024 * 1024) {
-      if (!__ENABLE_MC_DOWNLOAD__) {
-        // 国内发行版：不提供本体获取渠道，只引导用户自行导入
-        return {
-          success: false,
-          error: mt('mc.downloadDisabledMissing', { path: jarFile })
-        }
-      }
       console.log(`[Main] 客户端 jar 缺失/过小，启动前自动补齐: ${jarFile}`)
       const ensureResult = await ensureBaseGameFiles(versionId, targetDirName, (msg) => {
         event.sender.send('game-launch-status', { versionId: targetDirName, message: msg })
@@ -3125,11 +3110,6 @@ ipcMain.handle('download-server-jar', async (event, versionId: string) => {
         return { success: true, message: mt('mc.serverAlreadyExists') }
       }
       try { fs.unlinkSync(serverJar) } catch {}
-    }
-
-    // 国内发行版：server.jar 同属游戏本体，不代用户获取
-    if (!__ENABLE_MC_DOWNLOAD__) {
-      return { success: false, error: mt('mc.downloadDisabled') }
     }
 
     console.log(`[Main] 正在获取版本 ${versionId} 的官方下载地址...`)
@@ -5498,10 +5478,6 @@ async function installBaseVersionLight(versionId: string, versionUrl: string, ta
 
 // 下载 Minecraft 版本（支持自定义目录名）
 ipcMain.handle('download-version', async (event, versionId: string, versionUrl: string, directoryName?: string) => {
-  // 国内发行版不提供本体获取渠道
-  if (!__ENABLE_MC_DOWNLOAD__) {
-    return { success: false, error: mt('mc.downloadDisabled') }
-  }
   try {
     const targetDirName = directoryName || versionId
     console.log(`[Main] 开始下载版本: ${versionId} -> 目录: ${targetDirName}`)

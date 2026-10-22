@@ -6,7 +6,6 @@ import { useAccountsStore } from '../stores/accounts'
 import { useI18n } from 'vue-i18n'
 
 const { t } = useI18n()
-const { locale } = useI18n()
 const versionsStore = useVersionsStore()
 const settingsStore = useSettingsStore()
 const accountsStore = useAccountsStore()
@@ -257,15 +256,6 @@ const selectVersion = (directoryName: string) => {
 }
 
 const downloadVersion = async (versionId: string, existingDirectoryName?: string) => {
-  if (typeof __ENABLE_MC_DOWNLOAD__ !== 'undefined' && !__ENABLE_MC_DOWNLOAD__) {
-    const url = locale.value === 'zh' ? 'https://www.minecraft.net/zh-hans/download' : 'https://www.minecraft.net/en-us/download'
-    if ((window as any).electronAPI?.openBrowser) {
-      ;(window as any).electronAPI.openBrowser(url)
-      return
-    }
-    window.open(url, '_blank')
-    return
-  }
   openLoaderModal(versionId, existingDirectoryName)
 }
 
@@ -696,7 +686,7 @@ const toggleGameLog = () => {
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
             </svg>
-            {{ (typeof __ENABLE_MC_DOWNLOAD__ !== 'undefined' && !__ENABLE_MC_DOWNLOAD__) ? t('versionsUi.downloadGame') : t('versionsUi.download') }}
+            {{ t('versionsUi.download') }}
           </button>
           <div v-else-if="version.downloading" class="download-actions">
             <button
