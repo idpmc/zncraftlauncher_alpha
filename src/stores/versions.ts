@@ -22,11 +22,30 @@ export interface Version {
   mcVersion?: string
 }
 
+/**
+ * 各下载阶段在整体进度中的权重（json 2% / jar 8% / libraries 40% / assets 50%）。
+ *
+ * 全局监听器与 installVersion 内的局部监听器必须共用同一套权重：
+ * 之前两处公式不一致（全局 json*0.05 / jar*0.15 / libs*0.80，而且没有 assets 分支），
+ * 刷新后只剩全局监听器时进度会按另一套公式跳变，甚至在资源阶段直接归零。
+ */
+export const computeWeightedProgress = (type: string, progress: number): number => {
+  const p = Math.min(100, Math.max(0, progress || 0))
+  if (type === 'json') return p * 0.02
+  if (type === 'jar') return 2 + p * 0.08
+  if (type === 'libraries') return 10 + p * 0.40
+  if (type === 'assets') return 50 + p * 0.50
+  return 0
+}
+
 export const useVersionsStore = defineStore('versions', () => {
   const versions = ref<Version[]>([])
   const isLoading = ref(false)
   const isDownloading = ref(false)
   const lastSyncTime = ref<Date | null>(null)
+
+  // 统一下载任务中心（全局监听器与 initVersions 都要用到，故提到 store 顶层）
+  const downloadsStore = useDownloadsStore()
 
   const notifications = ref<{ id: string; versionId: string; versionName: string; type: 'downloading' | 'completed' | 'failed' | 'info'; progress: number; message?: string; timestamp: number }[]>([])
 
@@ -162,18 +181,19 @@ export const useVersionsStore = defineStore('versions', () => {
     globalListenersRegistered = true
 
     // 监听下载进度 - 更新对应版本的进度
-    window.electronAPI.onDownloadProgress((_event: unknown, data: { versionId: string; type: string; progress: number }) => {
+    window.electronAPI.onDownloadProgress((_event: unknown, data: { versionId: string; type: string; progress: number; speed?: number; totalBytes?: number; downloadedBytes?: number }) => {
       const cur = versions.value.find(v => getVersionKey(v) === data.versionId)
       if (!cur || !cur.downloading) return
-      let weightedProgress = 0
-      if (data.type === 'json') {
-        weightedProgress = data.progress * 0.05
-      } else if (data.type === 'jar') {
-        weightedProgress = 5 + data.progress * 0.15
-      } else if (data.type === 'libraries') {
-        weightedProgress = 20 + data.progress * 0.80
+      const finalProgress = Math.round(computeWeightedProgress(data.type, data.progress))
+      cur.downloadProgress = finalProgress
+
+      // 同步下载面板里的任务（刷新后局部监听器已失效，只能靠这里）
+      const taskId = `version-${data.versionId}`
+      if (downloadsStore.tasks.some(t => t.id === taskId)) {
+        const totalBytes = data.totalBytes || 0
+        const downloadedBytes = data.downloadedBytes || Math.round((finalProgress / 100) * totalBytes)
+        downloadsStore.updateProgress(taskId, finalProgress, data.speed || 0, downloadedBytes, totalBytes)
       }
-      cur.downloadProgress = Math.round(weightedProgress)
     })
 
     // 监听下载完成 - 标记版本状态（刷新后也能接收到完成事件）
@@ -189,6 +209,11 @@ export const useVersionsStore = defineStore('versions', () => {
         cur.downloading = false
         cur.downloadPaused = false
         cur.downloadProgress = 0
+      }
+      // 同步下载面板的任务状态（刷新后局部监听器已失效）
+      const taskId = `version-${data.versionId}`
+      if (downloadsStore.tasks.some(t => t.id === taskId)) {
+        downloadsStore.setStatus(taskId, data.success ? 'completed' : 'failed', data.error)
       }
       // 如果当前没有其他下载，重置全局下载状态
       const stillDownloading = versions.value.some(v => v.downloading)
@@ -228,6 +253,10 @@ export const useVersionsStore = defineStore('versions', () => {
           cur.downloading = false
           cur.downloadPaused = false
           cur.downloadProgress = 0
+        }
+        const taskId = `version-${data.versionId}`
+        if (downloadsStore.tasks.some(t => t.id === taskId)) {
+          downloadsStore.setStatus(taskId, 'cancelled')
         }
         const stillDownloading = versions.value.some(v => v.downloading)
         if (!stillDownloading) {
@@ -636,6 +665,11 @@ export const useVersionsStore = defineStore('versions', () => {
   }
 
   const initVersions = async () => {
+    // 注册全局下载监听器（完成 / 暂停 / 继续 / 取消）。
+    // 之前这个函数定义了却从未被调用，导致这些事件全部丢失：
+    // 暂停后 UI 不同步、取消后 UI 不复位、下载完成列表不刷新。
+    registerGlobalDownloadListeners()
+
     loadFromLocalStorage()
 
     const hasDownloading = versions.value.some(v => v.downloading)
@@ -649,6 +683,37 @@ export const useVersionsStore = defineStore('versions', () => {
 
     // 无论官网同步是否成功，都必须扫描磁盘来确认实际安装状态
     await scanInstalledVersions(true)
+
+    // 恢复"正在下载"状态：主进程仍在后台下载，但前端刷新后
+    // localStorage 里的 downloading 标记会被 scanInstalledVersions 重置，
+    // 结果进度条消失、暂停/取消按钮不可用，而下载其实还在跑。
+    try {
+      if (window.electronAPI?.getActiveDownloads) {
+        const active = await window.electronAPI.getActiveDownloads()
+        const list = active?.downloads || []
+        for (const d of list) {
+          const cur = versions.value.find(v => getVersionKey(v) === d.versionId)
+          if (!cur) continue
+          cur.downloading = true
+          cur.downloadPaused = !!d.paused
+          cur.downloadProgress = cur.downloadProgress || 0
+          downloadsStore.addTask({
+            id: `version-${d.versionId}`,
+            name: cur.displayName || cur.id,
+            category: 'version',
+            status: d.paused ? 'paused' : 'downloading',
+            subType: cur.id
+          })
+        }
+        if (list.length > 0) {
+          isDownloading.value = true
+          saveToLocalStorageNow()
+          console.log(`[Versions] 已恢复 ${list.length} 个进行中的下载任务`)
+        }
+      }
+    } catch (e) {
+      console.warn('[Versions] 恢复下载状态失败:', e)
+    }
   }
 
   const lazyInitVersions = () => {
@@ -676,7 +741,6 @@ export const useVersionsStore = defineStore('versions', () => {
     loader?: string
   }): Promise<boolean> => {
     const telemetryStore = useTelemetryStore()
-    const downloadsStore = useDownloadsStore()
     const { versionId, directoryName, displayName, loader } = params
 
     // 检查目录名是否已存在
@@ -767,18 +831,8 @@ export const useVersionsStore = defineStore('versions', () => {
           if (data.versionId === directoryName) {
             const cur = versions.value.find(v => getVersionKey(v) === directoryName)
             if (!cur) return
-            // 根据下载类型调整进度权重
-            let weightedProgress = 0
-            if (data.type === 'json') {
-              weightedProgress = data.progress * 0.02
-            } else if (data.type === 'jar') {
-              weightedProgress = 2 + data.progress * 0.08
-            } else if (data.type === 'libraries') {
-              weightedProgress = 10 + data.progress * 0.40
-            } else if (data.type === 'assets') {
-              weightedProgress = 50 + data.progress * 0.50
-            }
-            const finalProgress = Math.round(weightedProgress)
+            // 根据下载类型调整进度权重（与全局监听器共用同一套公式）
+            const finalProgress = Math.round(computeWeightedProgress(data.type, data.progress))
             cur.downloadProgress = finalProgress
 
             // 更新统一的下载任务进度
@@ -829,6 +883,18 @@ export const useVersionsStore = defineStore('versions', () => {
           // 保存状态到本地存储
           saveToLocalStorage()
         } else {
+          // 用户主动取消：不算失败（'download-cancelled' 事件已负责复位状态）
+          if ((result as any).cancelled) {
+            const cancelledCur = versions.value.find(v => getVersionKey(v) === directoryName)
+            if (cancelledCur) {
+              cancelledCur.downloading = false
+              cancelledCur.downloadPaused = false
+              cancelledCur.downloadProgress = 0
+            }
+            downloadsStore.setStatus(`version-${directoryName}`, 'cancelled')
+            saveToLocalStorage()
+            return false
+          }
           throw new Error(result.error || i18n.global.t('rt.stVersions.downloadFailed'))
         }
       } else {

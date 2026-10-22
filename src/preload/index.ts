@@ -66,6 +66,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // 取消下载
   cancelDownload: (versionId: string) => ipcRenderer.invoke('cancel-download', versionId),
 
+  // 获取当前仍在进行中的版本下载（刷新后恢复下载状态用）
+  getActiveDownloads: () => ipcRenderer.invoke('get-active-downloads'),
+
   // 监听下载暂停
   onDownloadPaused: (callback: (event: any, data: any) => void) => {
     ipcRenderer.on('download-paused', callback)
@@ -316,7 +319,7 @@ declare global {
       setLocale: (locale: string) => Promise<{ success: boolean; locale?: string }>
       openVersionDir: (versionId: string, directoryName?: string) => Promise<{ success: boolean; error?: string }>
       openSavesDir: (directoryName?: string) => Promise<{ success: boolean; error?: string }>
-      downloadVersion: (versionId: string, versionUrl: string, directoryName?: string) => Promise<{ success: boolean; message?: string; error?: string }>
+      downloadVersion: (versionId: string, versionUrl: string, directoryName?: string) => Promise<{ success: boolean; message?: string; error?: string; cancelled?: boolean; alreadyInstalled?: boolean }>
       onDownloadProgress: (callback: (event: any, data: any) => void) => () => void
       onJavaDownloadLog: (callback: (event: any, data: any) => void) => () => void
       getJavaDownloadLogs: (javaVersion: string) => Promise<string[]>
@@ -325,6 +328,7 @@ declare global {
       pauseDownload: (versionId: string) => Promise<{ success: boolean; error?: string }>
       resumeDownload: (versionId: string) => Promise<{ success: boolean; error?: string }>
       cancelDownload: (versionId: string) => Promise<{ success: boolean; error?: string }>
+      getActiveDownloads: () => Promise<{ success: boolean; downloads: { versionId: string; paused: boolean }[] }>
       onDownloadPaused: (callback: (event: any, data: { versionId: string }) => void) => () => void
       onDownloadResumed: (callback: (event: any, data: { versionId: string }) => void) => () => void
       onDownloadCancelled: (callback: (event: any, data: { versionId: string }) => void) => () => void
